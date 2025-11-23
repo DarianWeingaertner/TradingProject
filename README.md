@@ -71,4 +71,4 @@ df.to_csv("data/raw/URTH_1d.csv")
 - Format: CSV (UTF‑8, Header)
 
 ### Rohdaten-Beispiel
-![Rohdaten](.venv/images/Rohdaten.png)
+![Rohdaten](images/Rohdaten.jpeg)
