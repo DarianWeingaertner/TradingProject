@@ -2,73 +2,56 @@
 
 ## 1. Problem Definition
 
-Wir möchten ein Modell entwickeln, das vorhersagt, ob der MSCI World ETF (URTH) am nächsten Handelstag steigen oder fallen wird.  
+Wir möchten ein Modell entwickeln, das vorhersagt, ob der MSCI World ETF (URTH) **bis zum Ende des aktuellen Handelstags** steigt oder nicht.  
+Dazu nutzen wir **Intraday-Daten** (z. B. minuten- oder stundenbasierte Kursdaten) anstatt nur einen End-of-Day-Wert pro Tag.  
+
 Die Vorhersage soll später für eine einfache, regelbasierte Trading-Strategie genutzt und per Backtesting evaluiert werden.
+
+---
 
 ### Target Variable
 
-Für jeden Handelstag t definieren wir:
+Für jeden Handelstag \( d \) definieren wir:
 
+\[
+target(d) = 1, \text{ wenn } Close_d > Open_d
+\]
+\[
+target(d) = 0, \text{ sonst}
+\]
 
-target(t) = 1, wenn Close(t+1) > Close(t)
-target(t) = 0, sonst
+wobei \( Open_d \) der Eröffnungskurs und \( Close_d \) der Schlusskurs des Tages \( d \) ist.
 
+**Interpretation:**
 
-Interpretation:
-- 1 = Der ETF steigt am nächsten Tag  
-- 0 = Der ETF fällt oder bleibt gleich  
+- `1` = Der ETF schließt höher als er eröffnet (Tagesanstieg)
+- `0` = Der ETF schließt tiefer oder unverändert (kein Tagesanstieg)
 
-→ Das Problem ist eine binäre Klassifikation.
+→ Das Problem ist eine **binäre Klassifikation** auf Tagesebene mit **Intraday-Information** als Input.
+
+---
 
 ### Input-Variablen (Rohdaten)
 
-Wir verwenden End-of-Day-Daten (EOD):
+Wir verwenden **Intraday-Daten** (z. B. 1-Minuten- oder 1-Stunden-Bars) des ETFs URTH:
 
-- Date  
+- Timestamp / DateTime  
 - Open  
 - High  
 - Low  
 - Close  
-- Adj Close  
 - Volume  
 
-Später werden zusätzliche Features erstellt (z. B. Renditen, MAs, Volatilität, RSI, MACD).
+Optional werden zusätzliche Informationsquellen eingebunden:
 
-### Baseline
+- Historische Ereignisse / News (z. B. über *Alpaca News*)  
+  - Anzahl der News pro Zeitfenster  
+  - ggf. Sentiment-Scores (positiv/negativ)
 
-- Buy & Hold (immer investiert sein)
+Später werden aus den Rohdaten weitere Features erstellt (z. B. Intraday-Renditen, gleitende Durchschnitte, Volatilität, RSI, MACD, Volumen-Spikes, News-Features).
 
 ---
 
-## 2. Data Acquisition
+### Baseline
 
-### Datenquelle & API
-
-- Quelle: Yahoo Finance
-- API/Bibliothek: yfinance
-- ETF: URTH (iShares MSCI World ETF)
-- Intervall: 1 Tag (1d)
-- Zeitraum: ab 2010-01-01
-
-### Download-Prozess (Python)
-
-python
-import yfinance as yf
-
-df = yf.download(
-    "URTH",
-    start="2010-01-01",
-    interval="1d",
-    progress=False
-)
-
-df.to_csv("data/raw/URTH_1d.csv")
-
-
-### Speicherung
-
-- Pfad: data/raw/URTH_1d.csv
-- Format: CSV (UTF‑8, Header)
-
-### Rohdaten-Beispiel
-![Rohdaten](images/Rohdaten.jpeg)
+- **Buy & Hold** (immer investiert sein, keine aktive Intraday-Entscheidung)
