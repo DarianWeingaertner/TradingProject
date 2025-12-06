@@ -1,40 +1,26 @@
 # scripts/03_data_preparation.py
 """
-Step 03 — Data Preparation (pre-split)
---------------------------------------------------------
-Ziel:
-- Aus Intraday-Daten (1h) Tagesdaten aggregieren
-- Features und Zielvariable (Target) konstruieren
-- Deskriptive Statistiken und Plots für Features/Target erzeugen
-
-Target-Definition:
-- Für jeden Handelstag d:
-    target(d) = 1, wenn Close_d > Open_d
-                0, sonst
-
-Features (Beispiele):
-- intraday_return = (Close_d - Open_d) / Open_d
-- intraday_range  = (High_d - Low_d) / Open_d
-- daily_return    = Close_d / Close_{d-1} - 1
-- rolling_mean_k  = gleitender Mittelwert von daily_return über k Tage
-- rolling_vol_k   = gleitende Std-Abweichung von daily_return über k Tage
-
-Input:
-- CSV: data/raw/URTH_1h.csv
-
-Output:
-- CSV: data/processed/URTH_daily_features.csv
-- Plots:
-  - figures/URTH_daily_target_distribution.png
-  - figures/URTH_daily_feature_correlations.png
+Step 03 — Data Preparation (Intraday, post-split)
+-------------------------------------------------
+Ziele:
+- 1-Minuten-Rohdaten aus data/raw/URTH_1Min.csv laden
+- Feature-Engineering:
+  - Returns über verschiedene Horizonte
+  - Rolling Means & Volatilität
+  - Intraday-Position (Stunde, Minute des Tages)
+- Target definieren:
+  - Binäre Klassifikation: Steigt der Preis in den nächsten 15 Minuten? (1 = ja, 0 = nein)
+- Zeitbasierten Train/Validation-Split durchführen
+- Ergebnis als CSVs in data/processed speichern
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
 # ---------------------------------------------------------
@@ -42,12 +28,11 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------
 @dataclass
 class ProjectConfig:
-    ticker: str = "URTH"
-    interval: str = "1h"
-    base_dir: Path = Path(__file__).resolve().parents[1]
+    symbol: str = "URTH"
+    interval: str = "1Min"
+    prediction_horizon_min: int = 15  # wie viele Minuten in die Zukunft wir vorhersagen
 
-    # Hyperparameter für Feature Engineering
-    rolling_window: int = 5  # z. B. 5 Handelstage
+    base_dir: Path = Path(__file__).resolve().parents[1]
 
     @property
     def data_dir(self) -> Path:
@@ -62,215 +47,176 @@ class ProjectConfig:
         return self.data_dir / "processed"
 
     @property
-    def figures_dir(self) -> Path:
-        return self.base_dir / "figures"
-
-    @property
     def raw_csv_path(self) -> Path:
-        return self.raw_data_dir / f"{self.ticker}_{self.interval}.csv"
-
-    @property
-    def processed_csv_path(self) -> Path:
-        return self.processed_data_dir / f"{self.ticker}_daily_features.csv"
+        filename = f"{self.symbol}_{self.interval}.csv"
+        return self.raw_data_dir / filename
 
 
 # ---------------------------------------------------------
 # 2) Data Preparation
 # ---------------------------------------------------------
-class DataPreparation:
-    """
-    Bereitet Daten für das Modell vor (pre-split):
-    - Aggregation von 1h -> 1d
-    - Feature Engineering
-    - Target-Berechnung
-    - Statistiken & Plots
-    """
-
+class MSCIWorldDataPreparation:
     def __init__(self, cfg: ProjectConfig) -> None:
         self.cfg = cfg
+        self.df: pd.DataFrame | None = None
 
-    # ---------- Helper ----------
+    # ---------- Load ----------
 
-    def _ensure_dirs(self) -> None:
-        self.cfg.processed_data_dir.mkdir(parents=True, exist_ok=True)
-        self.cfg.figures_dir.mkdir(parents=True, exist_ok=True)
+    def load_raw_data(self) -> pd.DataFrame:
+        """
+        Lädt die 1-Minuten-Rohdaten und setzt timestamp als Index.
+        """
+        if not self.cfg.raw_csv_path.exists():
+            raise FileNotFoundError(
+                f"Rohdaten nicht gefunden: {self.cfg.raw_csv_path}. "
+                f"Führe zuerst 01_data_acquisition.py aus."
+            )
 
-    # ---------- 0) Laden der Intraday-Daten ----------
-
-    def load_intraday_data(self) -> pd.DataFrame:
-        print(f"📂 Lade Intraday-Daten aus: {self.cfg.raw_csv_path}")
         df = pd.read_csv(self.cfg.raw_csv_path)
+        if "timestamp" not in df.columns:
+            raise ValueError("Spalte 'timestamp' fehlt in der CSV.")
 
-        # Datetime-Spalte finden und sauber parsen
-        dt_col = "Datetime" if "Datetime" in df.columns else "Date"
-        df[dt_col] = pd.to_datetime(df[dt_col], utc=True, errors="coerce")
-        df[dt_col] = df[dt_col].dt.tz_localize(None)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df = df.set_index("timestamp").sort_index()
 
-        # numerische Spalten in float/int casten
-        num_cols = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
-        for c in num_cols:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        # sortieren, NaT raus
-        df = df.sort_values(dt_col)
-        df = df[df[dt_col].notna()].set_index(dt_col)
-
-        print(f"✅ Intraday-Daten geladen, Shape: {df.shape}")
+        self.df = df
+        print(f"✅ Rohdaten geladen für Data Preparation: {df.shape[0]} Zeilen.")
         return df
 
-    # ---------- 1) Aggregation 1h -> 1d ----------
+    # ---------- Feature Engineering ----------
 
-    def aggregate_to_daily(self, intraday: pd.DataFrame) -> pd.DataFrame:
-        print("\n🔄 Aggregiere Intraday-Daten zu Tagesdaten...")
+    def engineer_features(self) -> pd.DataFrame:
+        """
+        Erstellt Features basierend auf 1-Minuten-Daten.
+        """
+        assert self.df is not None, "DataFrame ist leer. load_raw_data() zuerst aufrufen."
+        df = self.df.copy()
 
-        daily = pd.DataFrame()
-        daily["Open"] = intraday["Open"].resample("1D").first()
-        daily["Close"] = intraday["Close"].resample("1D").last()
-        daily["High"] = intraday["High"].resample("1D").max()
-        daily["Low"] = intraday["Low"].resample("1D").min()
-        daily["Volume"] = intraday["Volume"].resample("1D").sum()
+        # 1) Returns (Vergangenheit)
+        df["ret_1m"] = df["close"].pct_change(1)
+        df["ret_5m"] = df["close"].pct_change(5)
+        df["ret_15m"] = df["close"].pct_change(15)
 
-        # Tage ohne Handel entfernen
-        daily = daily.dropna().reset_index()
-        daily = daily.rename(columns={"Datetime": "Date"})
+        # 2) Rolling Means und Volatilität (Std)
+        df["roll_mean_5m"] = df["close"].rolling(5).mean()
+        df["roll_mean_15m"] = df["close"].rolling(15).mean()
 
-        print(f"✅ Tagesdaten erstellt, Shape: {daily.shape}")
-        return daily
+        df["roll_std_5m"] = df["close"].rolling(5).std()
+        df["roll_std_15m"] = df["close"].rolling(15).std()
 
-    # ---------- 2) Feature Engineering ----------
+        # 3) Volumen-Features
+        df["vol_roll_mean_15m"] = df["volume"].rolling(15).mean()
+        df["vol_roll_std_15m"] = df["volume"].rolling(15).std()
 
-    def engineer_features(self, daily: pd.DataFrame) -> pd.DataFrame:
-        print("\n🛠 Erzeuge Features...")
+        # 4) Intraday-Position
+        df["hour"] = df.index.hour
+        df["minute_of_day"] = df["hour"] * 60 + df.index.minute
+        df["minute_of_day_norm"] = df["minute_of_day"] / (24 * 60)
 
-        df = daily.copy()
+        # 5) Optional: Verhältnis aktueller Close zum 15-Minuten-MA (Momentum / Trend)
+        df["close_to_roll_mean_15m"] = df["close"] / df["roll_mean_15m"] - 1
 
-        # Intraday-Maße
-        df["intraday_return"] = (df["Close"] - df["Open"]) / df["Open"]
-        df["intraday_range"] = (df["High"] - df["Low"]) / df["Open"]
-
-        # Tagesrendite auf Basis des Schlusskurses
-        df["daily_return"] = df["Close"].pct_change()
-
-        # Rolling-Features
-        window = self.cfg.rolling_window
-        df[f"rolling_mean_{window}"] = df["daily_return"].rolling(window).mean()
-        df[f"rolling_vol_{window}"] = df["daily_return"].rolling(window).std()
-
-        print(f"✅ Features erstellt mit rolling_window={window}")
+        self.df = df
+        print(f"✅ Features erstellt. Aktuelle Spaltenanzahl: {df.shape[1]}")
         return df
 
-    # ---------- 3) Target-Berechnung ----------
+    # ---------- Target Engineering ----------
 
-    def create_target(self, df: pd.DataFrame) -> pd.DataFrame:
-        print("\n🎯 Berechne Target-Variable (Close > Open)...")
+    def engineer_target(self) -> pd.DataFrame:
+        """
+        Definiert das Vorhersageziel:
+        - future_return_{horizon}min = (close_{t+h} / close_t - 1)
+        - target_up = 1, wenn future_return > 0, sonst 0
+        """
+        assert self.df is not None
+        df = self.df.copy()
 
-        df["target"] = (df["Close"] > df["Open"]).astype(int)
+        horizon = self.cfg.prediction_horizon_min
+        col_name = f"future_ret_{horizon}m"
 
-        print("🔎 Target-Verteilung (value_counts):")
-        print(df["target"].value_counts())
+        df[col_name] = df["close"].shift(-horizon) / df["close"] - 1
+        df["target_up"] = (df[col_name] > 0).astype(int)
 
+        self.df = df
+        print(f"✅ Target erstellt: {col_name} & target_up")
         return df
 
-    # ---------- 4) Plots ----------
+    # ---------- Cleaning & NaN Handling ----------
 
-    def plot_target_distribution(self, df: pd.DataFrame) -> None:
-        self._ensure_dirs()
+    def clean_and_drop_na(self) -> pd.DataFrame:
+        """
+        Entfernt Zeilen mit NaNs, die durch Rolling-Fenster und Shifts
+        entstehen (Anfang & Ende der Zeitreihe).
+        """
+        assert self.df is not None
+        df = self.df.copy()
 
-        plt.figure()
-        df["target"].value_counts().sort_index().plot(kind="bar")
-        plt.xticks([0, 1], ["0 (Close <= Open)", "1 (Close > Open)"], rotation=0)
-        plt.ylabel("Anzahl Tage")
-        plt.title(f"{self.cfg.ticker} — Target-Verteilung (Close > Open)")
-        plt.tight_layout()
+        before = df.shape[0]
+        df = df.dropna()
+        after = df.shape[0]
 
-        path = self.cfg.figures_dir / f"{self.cfg.ticker}_daily_target_distribution.png"
-        plt.savefig(path)
-        plt.close()
-        print(f"✅ Target-Verteilungsplot gespeichert: {path}")
+        print(f"🧹 NaN-Bereinigung: {before} → {after} Zeilen (entfernt: {before - after})")
 
-    def plot_feature_correlations(self, df: pd.DataFrame) -> None:
-        self._ensure_dirs()
+        self.df = df
+        return df
 
-        feature_cols = [
-            "intraday_return",
-            "intraday_range",
-            "daily_return",
-            f"rolling_mean_{self.cfg.rolling_window}",
-            f"rolling_vol_{self.cfg.rolling_window}",
-            "target",
-        ]
-        feature_cols = [c for c in feature_cols if c in df.columns]
+    # ---------- Train/Validation-Split ----------
 
-        corr = df[feature_cols].corr()
+    def train_validation_split(self, train_ratio: float = 0.8) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Zeitbasierter Train/Validation-Split.
+        Nutzt die chronologische Reihenfolge — keine zufällige Durchmischung.
+        """
+        assert self.df is not None
+        df = self.df.copy()
 
-        plt.figure(figsize=(6, 5))
-        plt.imshow(corr, interpolation="nearest")
-        plt.xticks(range(len(feature_cols)), feature_cols, rotation=45, ha="right")
-        plt.yticks(range(len(feature_cols)), feature_cols)
-        plt.colorbar(label="Korrelationskoeffizient")
-        plt.title(f"{self.cfg.ticker} — Korrelationsmatrix (Features & Target)")
-        plt.tight_layout()
+        n = df.shape[0]
+        split_idx = int(n * train_ratio)
 
-        path = self.cfg.figures_dir / f"{self.cfg.ticker}_daily_feature_correlations.png"
-        plt.savefig(path)
-        plt.close()
-        print(f"✅ Korrelationsplot gespeichert: {path}")
+        train_df = df.iloc[:split_idx].copy()
+        val_df = df.iloc[split_idx:].copy()
 
-    # ---------- 5) Findings ----------
+        print(f"🔀 Train/Val-Split bei Index {split_idx}: Train={train_df.shape[0]}, Val={val_df.shape[0]}")
+        return train_df, val_df
 
-    def print_findings(self, df: pd.DataFrame) -> None:
-        print("\n📝 Findings zur Datenvorbereitung:")
+    # ---------- Save ----------
 
-        print(f"- Anzahl Handelstage nach Aggregation: {len(df)}")
+    def save_processed(self, full_df: pd.DataFrame, train_df: pd.DataFrame, val_df: pd.DataFrame) -> None:
+        """
+        Speichert vollständigen Feature+Target-DataFrame und die Split-Subsets.
+        """
+        self.cfg.processed_data_dir.mkdir(parents=True, exist_ok=True)
 
-        pos_share = df["target"].mean()
-        print(
-            f"- Anteil Tage mit Close > Open (target=1): {pos_share:.2%} "
-            "(Klassenverteilung)."
-        )
+        full_path = self.cfg.processed_data_dir / "features_targets_full.csv"
+        train_path = self.cfg.processed_data_dir / "train.csv"
+        val_path = self.cfg.processed_data_dir / "val.csv"
 
-        print(
-            f"- 'intraday_return' fasst die Netto-Bewegung eines Tages "
-            f"zusammen, 'intraday_range' die Schwankungsbreite."
-        )
+        full_df.to_csv(full_path)
+        train_df.to_csv(train_path)
+        val_df.to_csv(val_path)
 
-        print(
-            f"- Rolling-Features über {self.cfg.rolling_window} Tage "
-            f"modellieren kurzfristige Trends (rolling_mean) und "
-            f"Volatilität (rolling_vol)."
-        )
+        print(f"💾 Vollständiger Datensatz gespeichert unter: {full_path}")
+        print(f"💾 Train-Set gespeichert unter: {train_path}")
+        print(f"💾 Validation-Set gespeichert unter: {val_path}")
 
     # ---------- Orchestrierung ----------
 
-    def run(self) -> pd.DataFrame:
-        self._ensure_dirs()
-
-        intraday = self.load_intraday_data()
-        daily = self.aggregate_to_daily(intraday)
-        feat_df = self.engineer_features(daily)
-        feat_df = self.create_target(feat_df)
-
-        # ein paar Zeilen zeigen
-        print("\n🔎 Beispielhafte Zeilen der vorbereiteten Daten:")
-        print(feat_df.head())
-
-        # Speichern
-        feat_df.to_csv(self.cfg.processed_csv_path, index=False)
-        print(f"\n✅ Vorbereitete Daten gespeichert unter: {self.cfg.processed_csv_path}")
-
-        # Plots & Findings
-        self.plot_target_distribution(feat_df)
-        self.plot_feature_correlations(feat_df)
-        self.print_findings(feat_df)
-
-        return feat_df
+    def run(self) -> None:
+        self.load_raw_data()
+        self.engineer_features()
+        self.engineer_target()
+        df_clean = self.clean_and_drop_na()
+        train_df, val_df = self.train_validation_split(train_ratio=0.8)
+        self.save_processed(df_clean, train_df, val_df)
 
 
+# ---------------------------------------------------------
+# 3) Skript-Einstiegspunkt
+# ---------------------------------------------------------
 def main() -> None:
     cfg = ProjectConfig()
-    dp = DataPreparation(cfg)
-    dp.run()
+    prep = MSCIWorldDataPreparation(cfg)
+    prep.run()
 
 
 if __name__ == "__main__":

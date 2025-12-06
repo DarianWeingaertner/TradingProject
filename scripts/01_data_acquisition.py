@@ -1,34 +1,31 @@
 # scripts/01_data_acquisition.py
 """
-Step 01 — Data Acquisition (MSCI World ETF, Intraday)
---------------------------------------------------------
+Step 01 — Data Acquisition (MSCI World ETF, Intraday via Alpaca)
+-----------------------------------------------------------------
 Ziel:
-- Intraday-Kursdaten (z. B. stündlich) für den MSCI World ETF laden
-- Quelle: Yahoo Finance (via yfinance)
+- Minutendaten (z. B. 1Min) für den MSCI World ETF laden
+- Quelle: Alpaca Market Data API (historische Daten)
 - Ticker: URTH (iShares MSCI World ETF, US-Listing)
 
 Hinweis:
-- Yahoo Finance stellt Intraday-Daten (z. B. 1h) nur für einen
-  begrenzten Zeitraum (ca. 730 Tage) bereit.
-  -> Deshalb verwenden wir für Intraday-Intervalle 'period' statt
-     einer festen Start-/End-Zeitspanne.
-
-Outputs:
-- CSV-Datei: data/raw/URTH_<interval>.csv
-
-Klassen:
-- ProjectConfig: hält zentrale Konfiguration und Pfade
-- YahooFinanceClient: lädt OHLCV-Daten von Yahoo Finance
-- MSCIWorldDataAcquisition: orchestriert Download + Speichern
+- Alpaca liefert historische Minutendaten kostenlos (Paper-Account reicht).
+- Wir ziehen hier die letzten `days_back` Tage als Minutendaten.
+- Output landet als CSV unter: data/raw/{symbol}_{interval}.csv
+  z. B.: data/raw/URTH_1Min.csv
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
 
-import yfinance as yf
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import os
+
 import pandas as pd
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
 
 # ---------------------------------------------------------
@@ -37,19 +34,18 @@ import pandas as pd
 @dataclass
 class ProjectConfig:
     """
-    Hält alle wichtigen Parameter für das Projekt.
+    Hält alle wichtigen Parameter für den Datenzugriff.
 
-    - ticker: Instrument, das wir analysieren (hier: MSCI World ETF)
-    - start_date / end_date: werden primär für Daily-Daten verwendet
-    - period: wird für Intraday-Daten verwendet (z. B. "730d")
-    - interval: Zeitauflösung (z. B. "1h", "15m", "1d")
+    - symbol: Instrument, das wir analysieren (hier: MSCI World ETF = URTH)
+    - interval: Zeitauflösung (Alpaca-Namenskonvention, z. B. "1Min", "5Min")
+    - days_back: wie viele Tage in die Vergangenheit wir Minutendaten holen
     - base_dir: Basisverzeichnis des Projekts
     """
-    ticker: str = "URTH"
-    start_date: str = "2012-01-01"
-    end_date: Optional[str] = None
-    interval: str = "1h"          # z. B. "1h", "15m", "1d"
-    period: Optional[str] = "730d"  # für Intraday sinnvoll, für Daily ignorierbar
+
+    symbol: str = "URTH"
+    interval: str = "1Min"  # Minutendaten
+    days_back: int = 30     # wie viele Tage zurück
+
     base_dir: Path = Path(__file__).resolve().parents[1]
 
     @property
@@ -61,83 +57,108 @@ class ProjectConfig:
         return self.data_dir / "raw"
 
     @property
-    def interval_label(self) -> str:
-        return self.interval
-
-    @property
     def raw_csv_path(self) -> Path:
-        return self.raw_data_dir / f"{self.ticker}_{self.interval_label}.csv"
+        """
+        Zielpfad für die Rohdaten-CSV, z. B. data/raw/URTH_1Min.csv
+        """
+        filename = f"{self.symbol}_{self.interval}.csv"
+        return self.raw_data_dir / filename
+
+    # Alpaca-Credentials (werden aus Umgebungsvariablen gelesen)
+    @property
+    def alpaca_api_key(self) -> str:
+        return os.environ.get("APCA_API_KEY_ID", "")
 
     @property
-    def is_intraday(self) -> bool:
-        """
-        True, wenn es sich um ein Intraday-Intervall handelt,
-        bei dem Yahoo die Historie begrenzt (z. B. "1m", "5m", "15m", "30m", "1h").
-        """
-        return self.interval.endswith("m") or self.interval.endswith("h")
+    def alpaca_secret_key(self) -> str:
+        return os.environ.get("APCA_API_SECRET_KEY", "")
 
 
 # ---------------------------------------------------------
-# 2) Client für Yahoo Finance
+# 2) Alpaca Market Data Client
 # ---------------------------------------------------------
-class YahooFinanceClient:
+class AlpacaMarketDataClientWrapper:
     """
-    Kapselt die Logik zum Laden von Kursdaten über yfinance.
+    Kapselt die Logik zum Laden von Kursdaten über Alpaca.
     """
 
     def __init__(self, cfg: ProjectConfig) -> None:
         self.cfg = cfg
 
-    def download_ohlcv(self) -> pd.DataFrame:
-        """
-        Lädt OHLCV-Daten für den konfigurierten Ticker
-        und gibt ein Pandas DataFrame zurück.
-        """
-        if self.cfg.is_intraday:
-            # Intraday: Yahoo erlaubt nur begrenzten Zeitraum -> period verwenden
-            print(
-                f"📥 Lade Intraday-Daten von Yahoo Finance: "
-                f"Ticker={self.cfg.ticker}, "
-                f"Period={self.cfg.period}, "
-                f"Interval={self.cfg.interval}"
-            )
-            df = yf.download(
-                self.cfg.ticker,
-                period=self.cfg.period,
-                interval=self.cfg.interval,
-                auto_adjust=False,
-                progress=True,
-            )
-        else:
-            # Daily: normal mit Start-/Enddatum
-            print(
-                f"📥 Lade Daily-Daten von Yahoo Finance: "
-                f"Ticker={self.cfg.ticker}, "
-                f"Start={self.cfg.start_date}, "
-                f"End={self.cfg.end_date}, "
-                f"Interval={self.cfg.interval}"
-            )
-            df = yf.download(
-                self.cfg.ticker,
-                start=self.cfg.start_date,
-                end=self.cfg.end_date,
-                interval=self.cfg.interval,
-                auto_adjust=False,
-                progress=True,
-            )
-
-        if df.empty:
+        if not self.cfg.alpaca_api_key or not self.cfg.alpaca_secret_key:
             raise RuntimeError(
-                "❌ Es wurden keine Daten geladen. "
-                "Bitte Ticker/Zeitraum/Interval/Internetverbindung prüfen."
+                "Alpaca API Keys nicht gesetzt. "
+                "Bitte Umgebungsvariablen APCA_API_KEY_ID und "
+                "APCA_API_SECRET_KEY setzen."
             )
 
-        # Index (Zeitstempel) als Spalte speichern
-        df = df.reset_index()
+        # Historischer Daten-Client
+        self.client = StockHistoricalDataClient(
+            api_key=self.cfg.alpaca_api_key,
+            secret_key=self.cfg.alpaca_secret_key,
+        )
 
-        # kleine Info zur Kontrolle
-        print(f"✅ Anzahl geladener Zeilen: {len(df)}")
-        print(f"🔁 Zeitbereich: {df.iloc[0, 0]} bis {df.iloc[-1, 0]}")
+    def _to_timeframe(self) -> TimeFrame:
+        """
+        Mappt den Text in cfg.interval auf ein TimeFrame-Objekt.
+        Aktuell unterstützen wir nur Minutendaten (1Min).
+        """
+        if self.cfg.interval == "1Min":
+            return TimeFrame.Minute
+        # falls du später z. B. "5Min" o. Ä. nutzt, könntest du hier erweitern
+        raise ValueError(f"Unsupported interval for Alpaca: {self.cfg.interval}")
+
+    def download_intraday_minutes(self) -> pd.DataFrame:
+        """
+        Lädt Minutendaten für das konfigurierte Symbol und gibt
+        ein Pandas DataFrame mit OHLCV zurück.
+        """
+
+        # Ende = jetzt (UTC, glatt auf volle Minute)
+        end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        start = end - timedelta(days=self.cfg.days_back)
+
+        timeframe = self._to_timeframe()
+
+        print(
+            f"📥 Lade Minutendaten von Alpaca: "
+            f"Symbol={self.cfg.symbol}, "
+            f"Interval={self.cfg.interval}, "
+            f"Start={start.isoformat()}, "
+            f"End={end.isoformat()}"
+        )
+
+        request = StockBarsRequest(
+            symbol_or_symbols=self.cfg.symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            adjustment="raw",
+            feed="iex",
+
+        )
+
+        bars = self.client.get_stock_bars(request)
+        df = bars.df
+
+        if df is None or df.empty:
+            raise RuntimeError(
+                "❌ Es wurden keine Daten von Alpaca zurückgeliefert. "
+                "Prüfe Symbol, Zeitraum, API-Keys und ob das Asset unterstützt wird."
+            )
+
+        # Wenn mehrere Symbole abgefragt werden, ist der Index MultiIndex.
+        # Hier nutzen wir nur ein Symbol -> ggf. herausfiltern.
+        if isinstance(df.index, pd.MultiIndex):
+            # MultiIndex-Level heißt normalerweise "symbol"
+            df = df.xs(self.cfg.symbol, level="symbol")
+
+        # Index schöner benennen
+        df = df.sort_index()
+        df.index.name = "timestamp"
+
+        # Spaltennamen dokumentieren (typischerweise: open, high, low, close, volume, vwap, trade_count)
+        print(f"✅ {len(df)} Zeilen geladen. Spalten: {list(df.columns)}")
 
         return df
 
@@ -145,46 +166,56 @@ class YahooFinanceClient:
 # ---------------------------------------------------------
 # 3) Data Acquisition Workflow
 # ---------------------------------------------------------
-class MSCIWorldDataAcquisition:
+class MSCIWorldDataAcquisitionAlpaca:
     """
     Orchestriert den kompletten Ablauf:
     - sicherstellen, dass Ordner existieren
-    - Daten mit YahooFinanceClient laden
+    - Minutendaten mit AlpacaMarketDataClientWrapper laden
     - CSV-Datei speichern
     """
 
-    def __init__(self, cfg: ProjectConfig, client: YahooFinanceClient) -> None:
+    def __init__(
+        self,
+        cfg: ProjectConfig,
+        client: AlpacaMarketDataClientWrapper,
+    ) -> None:
         self.cfg = cfg
         self.client = client
 
-    def run(self) -> pd.DataFrame:
+    def ensure_directories(self) -> None:
         """
-        Führt den Data-Acquisition-Workflow aus und gibt die Daten zurück.
+        Stellt sicher, dass data/raw existiert.
         """
-        # Ordner anlegen
         self.cfg.raw_data_dir.mkdir(parents=True, exist_ok=True)
 
-        # Daten laden
-        df = self.client.download_ohlcv()
+    def run(self) -> None:
+        """
+        Führt den kompletten ETL-Schritt aus:
+        - Ordner anlegen
+        - Daten laden
+        - CSV schreiben
+        """
+        self.ensure_directories()
+
+        df = self.client.download_intraday_minutes()
 
         # CSV speichern
-        df.to_csv(self.cfg.raw_csv_path, index=False)
-        print(f"✅ Daten gespeichert unter: {self.cfg.raw_csv_path}")
+        self.cfg.raw_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(self.cfg.raw_csv_path)
 
-        # kleine Vorschau zur Kontrolle / Präsentation
-        print("\n🔎 Vorschau auf die Rohdaten:")
-        print(df.head())
-
-        return df
+        print(
+            f"💾 Rohdaten gespeichert unter: {self.cfg.raw_csv_path} "
+            f"({len(df)} Zeilen)."
+        )
 
 
 # ---------------------------------------------------------
 # 4) Skript-Einstiegspunkt
 # ---------------------------------------------------------
 def main() -> None:
-    cfg = ProjectConfig()  # hier ggf. interval/period anpassen
-    client = YahooFinanceClient(cfg)
-    acquisition = MSCIWorldDataAcquisition(cfg, client)
+    cfg = ProjectConfig()  # ggf. symbol/interval/days_back anpassen
+    client = AlpacaMarketDataClientWrapper(cfg)
+    acquisition = MSCIWorldDataAcquisitionAlpaca(cfg, client)
     acquisition.run()
 
 

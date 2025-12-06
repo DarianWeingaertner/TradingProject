@@ -1,23 +1,24 @@
 # scripts/02_data_understanding.py
 """
-Step 02 — Data Understanding
---------------------------------------------------------
-Ziel:
-- Rohdaten (Intraday, z. B. 1h) einlesen
-- Relevante Spalten erklären
-- Deskriptive Statistiken berechnen
-- Relevante Plots erstellen
-- Erste Findings ausgeben
-
-Input:
-- CSV: data/raw/URTH_1h.csv (aus 01_data_acquisition.py)
+Step 02 — Data Understanding (Intraday, Alpaca-Minutenbars)
+-----------------------------------------------------------
+Ziele:
+- Minutendaten aus data/raw/URTH_1Min.csv laden
+- Grundlegende Statistiken berechnen und als CSV speichern
+- Wichtige Plots erstellen:
+  - Zeitreihe der (aggregierten) Close-Preise
+  - Histogramm der 1-Minuten-Returns
+  - Histogramm des Volumens
+  - Intraday-Pattern (durchschnittliche Volatilität & Volumen pro Stunde)
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 
 
@@ -26,8 +27,9 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------
 @dataclass
 class ProjectConfig:
-    ticker: str = "URTH"
-    interval: str = "1h"
+    symbol: str = "URTH"
+    interval: str = "1Min"
+
     base_dir: Path = Path(__file__).resolve().parents[1]
 
     @property
@@ -48,180 +50,200 @@ class ProjectConfig:
 
     @property
     def raw_csv_path(self) -> Path:
-        return self.raw_data_dir / f"{self.ticker}_{self.interval}.csv"
-
-    @property
-    def stats_csv_path(self) -> Path:
-        return self.reports_dir / f"{self.ticker}_{self.interval}_descriptive_stats.csv"
+        filename = f"{self.symbol}_{self.interval}.csv"
+        return self.raw_data_dir / filename
 
 
 # ---------------------------------------------------------
 # 2) Data Understanding
 # ---------------------------------------------------------
-class DataUnderstanding:
-    """
-    Führt den Data-Understanding-Step aus:
-    - Daten laden
-    - Spalten erklären
-    - Statistiken berechnen
-    - Plots erzeugen
-    - Findings loggen
-    """
-
+class MSCIWorldDataUnderstanding:
     def __init__(self, cfg: ProjectConfig) -> None:
         self.cfg = cfg
+        self.df: pd.DataFrame | None = None
 
-    # ---------- Helper ----------
+    # ---------- Load & basic processing ----------
 
-    def _ensure_dirs(self) -> None:
-        self.cfg.reports_dir.mkdir(parents=True, exist_ok=True)
-        self.cfg.figures_dir.mkdir(parents=True, exist_ok=True)
+    def load_raw_data(self) -> pd.DataFrame:
+        """
+        Lädt die Rohdaten aus data/raw/URTH_1Min.csv
+        und setzt den Timestamp als DatetimeIndex.
+        """
+        if not self.cfg.raw_csv_path.exists():
+            raise FileNotFoundError(
+                f"Rohdaten nicht gefunden: {self.cfg.raw_csv_path}. "
+                f"Führe zuerst 01_data_acquisition.py aus."
+            )
 
-    def load_data(self) -> pd.DataFrame:
-        print(f"📂 Lade Rohdaten aus: {self.cfg.raw_csv_path}")
         df = pd.read_csv(self.cfg.raw_csv_path)
 
-        # Zeitspalte nach Datetime (mit UTC) parsen und Zeitzone entfernen
-        dt_col = "Datetime" if "Datetime" in df.columns else "Date"
-        df[dt_col] = pd.to_datetime(df[dt_col], utc=True, errors="coerce")
-        df[dt_col] = df[dt_col].dt.tz_localize(None)
+        # Erwartete Spalten von Alpaca: timestamp, open, high, low, close, volume, trade_count, vwap
+        if "timestamp" not in df.columns:
+            raise ValueError("Spalte 'timestamp' fehlt in der CSV.")
 
-        # sortieren und NaT-Zeilen droppen
-        df = df.sort_values(dt_col)
-        df = df[df[dt_col].notna()].reset_index(drop=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df = df.set_index("timestamp").sort_index()
 
-        print(f"✅ Daten geladen, Shape: {df.shape}")
+        # Zusätzliche Felder für spätere Analysen
+        df["return_1min"] = df["close"].pct_change()
+        df["abs_return_1min"] = df["return_1min"].abs()
+        df["hour"] = df.index.hour
+        df["minute_of_day"] = df["hour"] * 60 + df.index.minute
+
+        self.df = df
+        print(f"✅ Rohdaten geladen: {df.shape[0]} Zeilen, {df.shape[1]} Spalten.")
+        print(f"   Zeitraum: {df.index.min()}  →  {df.index.max()}")
         return df
 
-    # ---------- 1) Spalten erklären ----------
+    # ---------- Reports ----------
 
-    def explain_columns(self, df: pd.DataFrame) -> None:
-        print("\n📘 Relevante Daten-Spalten:")
+    def save_descriptive_stats(self) -> None:
+        """
+        Speichert deskriptive Statistiken der wichtigsten numerischen Spalten.
+        """
+        assert self.df is not None, "DataFrame ist leer. load_raw_data() zuerst aufrufen."
 
-        explanations = {
-            "Datetime": "Zeitstempel der Intraday-Periode (z. B. 1h-Bar).",
-            "Date": "Handelstag (nur bei Daily-Daten).",
-            "Open": "Kurs zu Beginn des jeweiligen Intervalls.",
-            "High": "Höchster Kurs innerhalb des Intervalls.",
-            "Low": "Tiefster Kurs innerhalb des Intervalls.",
-            "Close": "Kurs am Ende des Intervalls.",
-            "Adj Close": "Um Dividenden/Splits bereinigter Schlusskurs.",
-            "Volume": "Gehandeltes Volumen im Intervall.",
-        }
+        self.cfg.reports_dir.mkdir(parents=True, exist_ok=True)
 
-        for col in df.columns:
-            desc = explanations.get(col, "(Keine spezielle Beschreibung hinterlegt.)")
-            print(f"- {col}: {desc}")
+        numeric_cols = ["open", "high", "low", "close", "volume", "trade_count", "vwap", "return_1min"]
+        existing_cols = [c for c in numeric_cols if c in self.df.columns]
 
-    # ---------- 2) Deskriptive Statistiken ----------
+        desc = self.df[existing_cols].describe().T
+        output_path = self.cfg.reports_dir / "intraday_descriptive_stats.csv"
+        desc.to_csv(output_path)
 
-    def compute_descriptive_stats(self, df: pd.DataFrame) -> pd.DataFrame:
-        print("\n📊 Berechne deskriptive Statistiken...")
+        print(f"💾 Deskriptive Statistiken gespeichert unter: {output_path}")
 
-        num_cols = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
-        num_cols = [c for c in num_cols if c in df.columns]
+    # ---------- Plot helpers ----------
 
-        # sicherstellen, dass die Spalten wirklich numerisch sind
-        for c in num_cols:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    def _ensure_figures_dir(self) -> None:
+        self.cfg.figures_dir.mkdir(parents=True, exist_ok=True)
 
-        stats = df[num_cols].describe().T  # count, mean, std, min, max, etc.
+    def plot_close_timeseries(self) -> None:
+        """
+        Zeitreihe der Close-Preise. Zur besseren Lesbarkeit wird auf 15-Minuten
+        aggregiert (Mean).
+        """
+        assert self.df is not None
+        self._ensure_figures_dir()
 
-        self._ensure_dirs()
-        stats.to_csv(self.cfg.stats_csv_path)
-        print(f"✅ Statistiken gespeichert unter: {self.cfg.stats_csv_path}")
+        # 15-Minuten-Resampling
+        df_resampled = self.df["close"].resample("15Min").mean()
 
-        print("\n🔎 Auszug aus den Statistiken:")
-        print(stats)
-
-        return stats
-
-    # ---------- 3) Plots ----------
-
-    def create_plots(self, df: pd.DataFrame) -> None:
-        print("\n📈 Erzeuge Plots...")
-
-        self._ensure_dirs()
-        dt_col = "Datetime" if "Datetime" in df.columns else "Date"
-
-        # Maske ohne NaT
-        mask = df[dt_col].notna()
-
-        # Time Series des Close-Preises
-        plt.figure()
-        plt.plot(df.loc[mask, dt_col], df.loc[mask, "Close"])
+        plt.figure(figsize=(12, 5))
+        plt.plot(df_resampled.index, df_resampled.values)
+        plt.title("URTH — 15-Min Close Price (Alpaca 1Min resampled)")
         plt.xlabel("Zeit")
-        plt.ylabel("Close")
-        plt.title(f"{self.cfg.ticker} Close Price ({self.cfg.interval})")
+        plt.ylabel("Close-Preis (USD)")
         plt.tight_layout()
-        ts_path = self.cfg.figures_dir / f"{self.cfg.ticker}_{self.cfg.interval}_close_timeseries.png"
-        plt.savefig(ts_path)
+
+        path = self.cfg.figures_dir / "01_close_timeseries_15min.png"
+        plt.savefig(path, dpi=150)
         plt.close()
-        print(f"✅ Time-Series-Plot gespeichert: {ts_path}")
 
-        # Intraday Returns
-        df["return"] = df["Close"].pct_change()
+        print(f"📊 Plot gespeichert: {path}")
 
-        plt.figure()
-        df["return"].hist(bins=100)
-        plt.xlabel("Return")
+    def plot_return_histogram(self) -> None:
+        """
+        Histogramm der 1-Minuten-Returns.
+        """
+        assert self.df is not None
+        self._ensure_figures_dir()
+
+        returns = self.df["return_1min"].dropna()
+        # Ausreißer kappen, damit das Histogramm sinnvoll aussieht
+        returns = returns.clip(lower=returns.quantile(0.01), upper=returns.quantile(0.99))
+
+        plt.figure(figsize=(8, 5))
+        plt.hist(returns, bins=50)
+        plt.title("URTH — Histogramm der 1-Minuten-Returns")
+        plt.xlabel("Return (close_t / close_{t-1} - 1)")
         plt.ylabel("Häufigkeit")
-        plt.title(f"{self.cfg.ticker} Intraday Returns ({self.cfg.interval})")
         plt.tight_layout()
-        ret_path = self.cfg.figures_dir / f"{self.cfg.ticker}_{self.cfg.interval}_return_hist.png"
-        plt.savefig(ret_path)
-        plt.close()
-        print(f"✅ Return-Histogramm gespeichert: {ret_path}")
 
-        # Volumen-Verteilung
-        plt.figure()
-        df["Volume"].hist(bins=100)
-        plt.xlabel("Volume")
+        path = self.cfg.figures_dir / "02_return_histogram_1min.png"
+        plt.savefig(path, dpi=150)
+        plt.close()
+
+        print(f"📊 Plot gespeichert: {path}")
+
+    def plot_volume_histogram(self) -> None:
+        """
+        Histogramm des Volumens (log-skaliert).
+        """
+        assert self.df is not None
+        self._ensure_figures_dir()
+
+        volume = self.df["volume"].replace(0, np.nan).dropna()
+        log_vol = np.log10(volume)
+
+        plt.figure(figsize=(8, 5))
+        plt.hist(log_vol, bins=50)
+        plt.title("URTH — Histogramm des Volumens (log10)")
+        plt.xlabel("log10(Volume)")
         plt.ylabel("Häufigkeit")
-        plt.title(f"{self.cfg.ticker} Volumen-Verteilung ({self.cfg.interval})")
         plt.tight_layout()
-        vol_path = self.cfg.figures_dir / f"{self.cfg.ticker}_{self.cfg.interval}_volume_hist.png"
-        plt.savefig(vol_path)
+
+        path = self.cfg.figures_dir / "03_volume_histogram_log.png"
+        plt.savefig(path, dpi=150)
         plt.close()
-        print(f"✅ Volumen-Histogramm gespeichert: {vol_path}")
 
-    # ---------- 4) Findings ----------
+        print(f"📊 Plot gespeichert: {path}")
 
-    def print_findings(self, stats: pd.DataFrame) -> None:
-        print("\n📝 Erste Findings (kurz & knackig):")
+    def plot_intraday_patterns(self) -> None:
+        """
+        Intraday-Pattern:
+        - durchschnittliche absolute 1-Minuten-Returns pro Stunde
+        - durchschnittliches Volumen pro Stunde
+        """
+        assert self.df is not None
+        self._ensure_figures_dir()
 
-        close_stats = stats.loc["Close"]
-        vol_stats = stats.loc["Volume"]
-
-        print(
-            f"- Close: Mittelwert ≈ {close_stats['mean']:.2f}, "
-            f"Min = {close_stats['min']:.2f}, Max = {close_stats['max']:.2f}"
+        grouped = self.df.groupby("hour").agg(
+            mean_abs_return=("abs_return_1min", "mean"),
+            mean_volume=("volume", "mean"),
         )
-        print(
-            f"- Volume: Median ≈ {vol_stats['50%']:.0f}, "
-            f"starke Unterschiede zwischen Min ({vol_stats['min']:.0f}) "
-            f"und Max ({vol_stats['max']:.0f})."
-        )
-        print(
-            "- Die Return-Verteilung ist (wie typisch für Finanzdaten) "
-            "rechtsschief mit vielen kleinen Bewegungen und einigen Ausreißern."
-        )
+
+        fig, ax1 = plt.subplots(figsize=(10, 5))
+
+        hours = grouped.index
+
+        ax1.plot(hours, grouped["mean_abs_return"], marker="o", label="Ø |Return| (1Min)")
+        ax1.set_xlabel("Stunde des Tages (UTC)")
+        ax1.set_ylabel("Ø absolute 1-Minuten-Returns")
+        ax1.grid(True, axis="y")
+
+        ax2 = ax1.twinx()
+        ax2.plot(hours, grouped["mean_volume"], marker="s", color="orange", label="Ø Volume")
+        ax2.set_ylabel("Ø Volume")
+
+        plt.title("URTH — Intraday-Pattern: Volatilität & Volumen pro Stunde")
+        fig.tight_layout()
+
+        path = self.cfg.figures_dir / "04_intraday_pattern_hourly.png"
+        plt.savefig(path, dpi=150)
+        plt.close()
+
+        print(f"📊 Plot gespeichert: {path}")
 
     # ---------- Orchestrierung ----------
 
-    def run(self) -> pd.DataFrame:
-        df = self.load_data()
-        self.explain_columns(df)
-        stats = self.compute_descriptive_stats(df)
-        self.create_plots(df)
-        self.print_findings(stats)
-        return df
+    def run(self) -> None:
+        self.load_raw_data()
+        self.save_descriptive_stats()
+        self.plot_close_timeseries()
+        self.plot_return_histogram()
+        self.plot_volume_histogram()
+        self.plot_intraday_patterns()
 
 
+# ---------------------------------------------------------
+# 3) Skript-Einstiegspunkt
+# ---------------------------------------------------------
 def main() -> None:
     cfg = ProjectConfig()
-    du = DataUnderstanding(cfg)
-    du.run()
+    understanding = MSCIWorldDataUnderstanding(cfg)
+    understanding.run()
 
 
 if __name__ == "__main__":
