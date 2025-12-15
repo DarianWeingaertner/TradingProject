@@ -1,17 +1,15 @@
 # scripts/03_data_preparation.py
 """
-Step 03 — Data Preparation (Intraday, post-split)
--------------------------------------------------
+Step 03 — Data Preparation (SPY 1Min + GLD 1Min)
+------------------------------------------------
 Ziele:
-- 1-Minuten-Rohdaten aus data/raw/URTH_1Min.csv laden
-- Feature-Engineering:
-  - Returns über verschiedene Horizonte
-  - Rolling Means & Volatilität
-  - Intraday-Position (Stunde, Minute des Tages)
-- Target definieren:
-  - Binäre Klassifikation: Steigt der Preis in den nächsten 15 Minuten? (1 = ja, 0 = nein)
-- Zeitbasierten Train/Validation-Split durchführen
-- Ergebnis als CSVs in data/processed speichern
+- SPY 1-Minuten-Rohdaten + GLD 1-Minuten-Rohdaten laden
+- Zusammenführen per Timestamp (inner join)
+- Features erstellen (SPY + GLD + Cross)
+- Target definieren (auf SPY):
+  Binär: Steigt SPY in den nächsten 15 Minuten? (1/0)
+- Zeitbasierten Train/Validation-Split
+- Speichern in data/processed
 """
 
 from __future__ import annotations
@@ -19,172 +17,169 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
 
-# ---------------------------------------------------------
-# 1) Projekt-Konfiguration
-# ---------------------------------------------------------
 @dataclass
 class ProjectConfig:
-    symbol: str = "URTH"
-    interval: str = "1Min"
-    prediction_horizon_min: int = 15  # wie viele Minuten in die Zukunft wir vorhersagen
+    primary_symbol: str = "SPY"
+    gold_symbol: str = "GLD"
+
+    primary_interval: str = "1Min"
+    gold_interval: str = "1Min"
+
+    prediction_horizon_min: int = 15
+    train_ratio: float = 0.8
 
     base_dir: Path = Path(__file__).resolve().parents[1]
 
     @property
-    def data_dir(self) -> Path:
-        return self.base_dir / "data"
-
-    @property
     def raw_data_dir(self) -> Path:
-        return self.data_dir / "raw"
+        return self.base_dir / "data" / "raw"
 
     @property
     def processed_data_dir(self) -> Path:
-        return self.data_dir / "processed"
+        return self.base_dir / "data" / "processed"
 
-    @property
-    def raw_csv_path(self) -> Path:
-        filename = f"{self.symbol}_{self.interval}.csv"
-        return self.raw_data_dir / filename
+    def raw_csv_path(self, symbol: str, interval: str) -> Path:
+        return self.raw_data_dir / f"{symbol}_{interval}.csv"
 
 
-# ---------------------------------------------------------
-# 2) Data Preparation
-# ---------------------------------------------------------
-class MSCIWorldDataPreparation:
+class DataPreparation:
     def __init__(self, cfg: ProjectConfig) -> None:
         self.cfg = cfg
         self.df: pd.DataFrame | None = None
 
-    # ---------- Load ----------
-
-    def load_raw_data(self) -> pd.DataFrame:
-        """
-        Lädt die 1-Minuten-Rohdaten und setzt timestamp als Index.
-        """
-        if not self.cfg.raw_csv_path.exists():
+    # ---------- loading ----------
+    def load_symbol(self, symbol: str, interval: str) -> pd.DataFrame:
+        path = self.cfg.raw_csv_path(symbol, interval)
+        if not path.exists():
             raise FileNotFoundError(
-                f"Rohdaten nicht gefunden: {self.cfg.raw_csv_path}. "
-                f"Führe zuerst 01_data_acquisition.py aus."
+                f"Rohdaten nicht gefunden: {path}. Bitte zuerst scripts/01_data_acquisition.py ausführen."
             )
 
-        df = pd.read_csv(self.cfg.raw_csv_path)
+        df = pd.read_csv(path)
         if "timestamp" not in df.columns:
-            raise ValueError("Spalte 'timestamp' fehlt in der CSV.")
+            raise ValueError(f"{symbol}: Spalte 'timestamp' fehlt.")
 
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         df = df.set_index("timestamp").sort_index()
 
-        self.df = df
-        print(f"✅ Rohdaten geladen für Data Preparation: {df.shape[0]} Zeilen.")
+        if interval != "1Min":
+            raise ValueError(f"{symbol}: Expected 1Min, got {interval} (Script 03 ist für 1Min+1Min).")
+
         return df
 
-    # ---------- Feature Engineering ----------
+    # ---------- merge ----------
+    def merge_spy_gold(self) -> pd.DataFrame:
+        spy = self.load_symbol(self.cfg.primary_symbol, self.cfg.primary_interval).add_prefix("spy_")
+        gld = self.load_symbol(self.cfg.gold_symbol, self.cfg.gold_interval).add_prefix("gld_")
 
+        # Inner join: nur Minuten, in denen beide Symbole Bars haben
+        df = spy.join(gld, how="inner").sort_index()
+
+        # Doppelte Timestamps entfernen (safety)
+        df = df[~df.index.duplicated(keep="last")]
+
+        self.df = df
+        print(f"✅ Merged DF: {df.shape[0]} Zeilen, {df.shape[1]} Spalten.")
+        print(f"   Zeitraum: {df.index.min()} → {df.index.max()}")
+        return df
+
+    # ---------- features ----------
     def engineer_features(self) -> pd.DataFrame:
-        """
-        Erstellt Features basierend auf 1-Minuten-Daten.
-        """
-        assert self.df is not None, "DataFrame ist leer. load_raw_data() zuerst aufrufen."
+        assert self.df is not None
         df = self.df.copy()
 
-        # 1) Returns (Vergangenheit)
-        df["ret_1m"] = df["close"].pct_change(1)
-        df["ret_5m"] = df["close"].pct_change(5)
-        df["ret_15m"] = df["close"].pct_change(15)
+        # --- SPY Features ---
+        df["spy_ret_1m"] = df["spy_close"].pct_change(1)
+        df["spy_ret_5m"] = df["spy_close"].pct_change(5)
+        df["spy_ret_15m"] = df["spy_close"].pct_change(15)
 
-        # 2) Rolling Means und Volatilität (Std)
-        df["roll_mean_5m"] = df["close"].rolling(5).mean()
-        df["roll_mean_15m"] = df["close"].rolling(15).mean()
+        df["spy_roll_mean_5m"] = df["spy_close"].rolling(5).mean()
+        df["spy_roll_mean_15m"] = df["spy_close"].rolling(15).mean()
+        df["spy_roll_std_5m"] = df["spy_close"].rolling(5).std()
+        df["spy_roll_std_15m"] = df["spy_close"].rolling(15).std()
 
-        df["roll_std_5m"] = df["close"].rolling(5).std()
-        df["roll_std_15m"] = df["close"].rolling(15).std()
+        df["spy_vol_roll_mean_15m"] = df["spy_volume"].rolling(15).mean()
+        df["spy_vol_roll_std_15m"] = df["spy_volume"].rolling(15).std()
 
-        # 3) Volumen-Features
-        df["vol_roll_mean_15m"] = df["volume"].rolling(15).mean()
-        df["vol_roll_std_15m"] = df["volume"].rolling(15).std()
+        # Momentum relativ zur MA
+        df["spy_close_to_roll_mean_15m"] = df["spy_close"] / df["spy_roll_mean_15m"] - 1
 
-        # 4) Intraday-Position
+        # --- GLD Features (intraday, analog) ---
+        df["gld_ret_1m"] = df["gld_close"].pct_change(1)
+        df["gld_ret_5m"] = df["gld_close"].pct_change(5)
+        df["gld_ret_15m"] = df["gld_close"].pct_change(15)
+
+        df["gld_roll_mean_5m"] = df["gld_close"].rolling(5).mean()
+        df["gld_roll_mean_15m"] = df["gld_close"].rolling(15).mean()
+        df["gld_roll_std_5m"] = df["gld_close"].rolling(5).std()
+        df["gld_roll_std_15m"] = df["gld_close"].rolling(15).std()
+
+        df["gld_vol_roll_mean_15m"] = df["gld_volume"].rolling(15).mean()
+        df["gld_vol_roll_std_15m"] = df["gld_volume"].rolling(15).std()
+
+        df["gld_close_to_roll_mean_15m"] = df["gld_close"] / df["gld_roll_mean_15m"] - 1
+
+        # --- Cross Features ---
+        df["ret_spy_minus_gld_1m"] = df["spy_ret_1m"] - df["gld_ret_1m"]
+        df["ret_spy_minus_gld_15m"] = df["spy_ret_15m"] - df["gld_ret_15m"]
+
+        df["vol_ratio_spy_gld_15m"] = df["spy_roll_std_15m"] / (df["gld_roll_std_15m"] + 1e-12)
+
+        # Optional: Spread/Ratio (manchmal stabiler als Differenz)
+        df["price_ratio_spy_gld"] = df["spy_close"] / (df["gld_close"] + 1e-12)
+
+        # --- Intraday Position ---
         df["hour"] = df.index.hour
         df["minute_of_day"] = df["hour"] * 60 + df.index.minute
         df["minute_of_day_norm"] = df["minute_of_day"] / (24 * 60)
 
-        # 5) Optional: Verhältnis aktueller Close zum 15-Minuten-MA (Momentum / Trend)
-        df["close_to_roll_mean_15m"] = df["close"] / df["roll_mean_15m"] - 1
-
         self.df = df
-        print(f"✅ Features erstellt. Aktuelle Spaltenanzahl: {df.shape[1]}")
+        print(f"✅ Features erstellt. Spalten: {df.shape[1]}")
         return df
 
-    # ---------- Target Engineering ----------
-
+    # ---------- target ----------
     def engineer_target(self) -> pd.DataFrame:
-        """
-        Definiert das Vorhersageziel:
-        - future_return_{horizon}min = (close_{t+h} / close_t - 1)
-        - target_up = 1, wenn future_return > 0, sonst 0
-        """
         assert self.df is not None
         df = self.df.copy()
 
-        horizon = self.cfg.prediction_horizon_min
-        col_name = f"future_ret_{horizon}m"
+        h = self.cfg.prediction_horizon_min
+        col = f"future_ret_{h}m"
 
-        df[col_name] = df["close"].shift(-horizon) / df["close"] - 1
-        df["target_up"] = (df[col_name] > 0).astype(int)
+        df[col] = df["spy_close"].shift(-h) / df["spy_close"] - 1
+        df["target_up"] = (df[col] > 0).astype(int)
 
         self.df = df
-        print(f"✅ Target erstellt: {col_name} & target_up")
+        print(f"✅ Target erstellt: {col} + target_up (auf SPY)")
         return df
 
-    # ---------- Cleaning & NaN Handling ----------
-
-    def clean_and_drop_na(self) -> pd.DataFrame:
-        """
-        Entfernt Zeilen mit NaNs, die durch Rolling-Fenster und Shifts
-        entstehen (Anfang & Ende der Zeitreihe).
-        """
+    # ---------- cleaning ----------
+    def clean_drop_na(self) -> pd.DataFrame:
         assert self.df is not None
         df = self.df.copy()
-
         before = df.shape[0]
         df = df.dropna()
         after = df.shape[0]
-
-        print(f"🧹 NaN-Bereinigung: {before} → {after} Zeilen (entfernt: {before - after})")
-
+        print(f"🧹 NaN-Bereinigung: {before} → {after} (entfernt {before - after})")
         self.df = df
         return df
 
-    # ---------- Train/Validation-Split ----------
-
-    def train_validation_split(self, train_ratio: float = 0.8) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Zeitbasierter Train/Validation-Split.
-        Nutzt die chronologische Reihenfolge — keine zufällige Durchmischung.
-        """
+    # ---------- split ----------
+    def train_val_split(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         assert self.df is not None
         df = self.df.copy()
-
-        n = df.shape[0]
-        split_idx = int(n * train_ratio)
-
-        train_df = df.iloc[:split_idx].copy()
-        val_df = df.iloc[split_idx:].copy()
-
-        print(f"🔀 Train/Val-Split bei Index {split_idx}: Train={train_df.shape[0]}, Val={val_df.shape[0]}")
+        n = len(df)
+        split = int(n * self.cfg.train_ratio)
+        train_df = df.iloc[:split].copy()
+        val_df = df.iloc[split:].copy()
+        print(f"🔀 Split: Train={len(train_df)}, Val={len(val_df)}")
         return train_df, val_df
 
-    # ---------- Save ----------
-
-    def save_processed(self, full_df: pd.DataFrame, train_df: pd.DataFrame, val_df: pd.DataFrame) -> None:
-        """
-        Speichert vollständigen Feature+Target-DataFrame und die Split-Subsets.
-        """
+    # ---------- save ----------
+    def save(self, full_df: pd.DataFrame, train_df: pd.DataFrame, val_df: pd.DataFrame) -> None:
         self.cfg.processed_data_dir.mkdir(parents=True, exist_ok=True)
 
         full_path = self.cfg.processed_data_dir / "features_targets_full.csv"
@@ -195,28 +190,23 @@ class MSCIWorldDataPreparation:
         train_df.to_csv(train_path)
         val_df.to_csv(val_path)
 
-        print(f"💾 Vollständiger Datensatz gespeichert unter: {full_path}")
-        print(f"💾 Train-Set gespeichert unter: {train_path}")
-        print(f"💾 Validation-Set gespeichert unter: {val_path}")
+        print(f"💾 Gespeichert: {full_path}")
+        print(f"💾 Gespeichert: {train_path}")
+        print(f"💾 Gespeichert: {val_path}")
 
-    # ---------- Orchestrierung ----------
-
+    # ---------- run ----------
     def run(self) -> None:
-        self.load_raw_data()
+        self.merge_spy_gold()
         self.engineer_features()
         self.engineer_target()
-        df_clean = self.clean_and_drop_na()
-        train_df, val_df = self.train_validation_split(train_ratio=0.8)
-        self.save_processed(df_clean, train_df, val_df)
+        df_clean = self.clean_drop_na()
+        train_df, val_df = self.train_val_split()
+        self.save(df_clean, train_df, val_df)
 
 
-# ---------------------------------------------------------
-# 3) Skript-Einstiegspunkt
-# ---------------------------------------------------------
 def main() -> None:
     cfg = ProjectConfig()
-    prep = MSCIWorldDataPreparation(cfg)
-    prep.run()
+    DataPreparation(cfg).run()
 
 
 if __name__ == "__main__":

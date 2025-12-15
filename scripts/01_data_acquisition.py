@@ -1,17 +1,14 @@
-# scripts/01_data_acquisition.py
 """
-Step 01 — Data Acquisition (MSCI World ETF, Intraday via Alpaca)
------------------------------------------------------------------
+Step 01 — Data Acquisition (Alpaca)
+-----------------------------------
 Ziel:
-- Minutendaten (z. B. 1Min) für den MSCI World ETF laden
-- Quelle: Alpaca Market Data API (historische Daten)
-- Ticker: URTH (iShares MSCI World ETF, US-Listing)
+- SPY als 1Min (intraday)
+- GLD als 1Day (daily)
+- mindestens 5 Jahre zurück
 
-Hinweis:
-- Alpaca liefert historische Minutendaten kostenlos (Paper-Account reicht).
-- Wir ziehen hier die letzten `days_back` Tage als Minutendaten.
-- Output landet als CSV unter: data/raw/{symbol}_{interval}.csv
-  z. B.: data/raw/URTH_1Min.csv
+Output:
+- data/raw/SPY_1Min.csv
+- data/raw/GLD_1Min.csv
 """
 
 from __future__ import annotations
@@ -19,34 +16,45 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
 import os
+import time
 
 import pandas as pd
+from dotenv import load_dotenv
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
+load_dotenv()
 
-# ---------------------------------------------------------
-# 1) Projekt-Konfiguration
-# ---------------------------------------------------------
+
 @dataclass
 class ProjectConfig:
-    """
-    Hält alle wichtigen Parameter für den Datenzugriff.
+    primary_symbol: str = "SPY"
+    gold_symbol: str = "GLD"
 
-    - symbol: Instrument, das wir analysieren (hier: MSCI World ETF = URTH)
-    - interval: Zeitauflösung (Alpaca-Namenskonvention, z. B. "1Min", "5Min")
-    - days_back: wie viele Tage in die Vergangenheit wir Minutendaten holen
-    - base_dir: Basisverzeichnis des Projekts
-    """
+    # separate intervals per symbol
+    primary_interval: str = "1Min"
+    gold_interval: str = "1Min"
 
-    symbol: str = "URTH"
-    interval: str = "1Min"  # Minutendaten
-    days_back: int = 30     # wie viele Tage zurück
+    years_back: int = 5
+
+    # Chunking nur für Intraday sinnvoll
+    chunk_download: bool = True
+    chunk_days_intraday: int = 30
+
+    feed: str = "iex"
+    adjustment: str = "raw"
 
     base_dir: Path = Path(__file__).resolve().parents[1]
+
+    @property
+    def symbol_configs(self) -> list[tuple[str, str]]:
+        return [
+            (self.primary_symbol, self.primary_interval),
+            (self.gold_symbol, self.gold_interval),
+        ]
 
     @property
     def data_dir(self) -> Path:
@@ -56,15 +64,9 @@ class ProjectConfig:
     def raw_data_dir(self) -> Path:
         return self.data_dir / "raw"
 
-    @property
-    def raw_csv_path(self) -> Path:
-        """
-        Zielpfad für die Rohdaten-CSV, z. B. data/raw/URTH_1Min.csv
-        """
-        filename = f"{self.symbol}_{self.interval}.csv"
-        return self.raw_data_dir / filename
+    def raw_csv_path(self, symbol: str, interval: str) -> Path:
+        return self.raw_data_dir / f"{symbol}_{interval}.csv"
 
-    # Alpaca-Credentials (werden aus Umgebungsvariablen gelesen)
     @property
     def alpaca_api_key(self) -> str:
         return os.environ.get("APCA_API_KEY_ID", "")
@@ -74,149 +76,132 @@ class ProjectConfig:
         return os.environ.get("APCA_API_SECRET_KEY", "")
 
 
-# ---------------------------------------------------------
-# 2) Alpaca Market Data Client
-# ---------------------------------------------------------
 class AlpacaMarketDataClientWrapper:
-    """
-    Kapselt die Logik zum Laden von Kursdaten über Alpaca.
-    """
-
     def __init__(self, cfg: ProjectConfig) -> None:
         self.cfg = cfg
 
         if not self.cfg.alpaca_api_key or not self.cfg.alpaca_secret_key:
             raise RuntimeError(
-                "Alpaca API Keys nicht gesetzt. "
-                "Bitte Umgebungsvariablen APCA_API_KEY_ID und "
-                "APCA_API_SECRET_KEY setzen."
+                "Alpaca API Keys nicht gesetzt.\n"
+                "Bitte APCA_API_KEY_ID und APCA_API_SECRET_KEY setzen (z.B. via .env)."
             )
 
-        # Historischer Daten-Client
         self.client = StockHistoricalDataClient(
             api_key=self.cfg.alpaca_api_key,
             secret_key=self.cfg.alpaca_secret_key,
         )
 
-    def _to_timeframe(self) -> TimeFrame:
-        """
-        Mappt den Text in cfg.interval auf ein TimeFrame-Objekt.
-        Aktuell unterstützen wir nur Minutendaten (1Min).
-        """
-        if self.cfg.interval == "1Min":
+    @staticmethod
+    def _to_timeframe(interval: str) -> TimeFrame:
+        if interval == "1Min":
             return TimeFrame.Minute
-        # falls du später z. B. "5Min" o. Ä. nutzt, könntest du hier erweitern
-        raise ValueError(f"Unsupported interval for Alpaca: {self.cfg.interval}")
+        if interval == "1Day":
+            return TimeFrame.Day
+        raise ValueError(f"Unsupported interval: {interval}")
 
-    def download_intraday_minutes(self) -> pd.DataFrame:
-        """
-        Lädt Minutendaten für das konfigurierte Symbol und gibt
-        ein Pandas DataFrame mit OHLCV zurück.
-        """
-
-        # Ende = jetzt (UTC, glatt auf volle Minute)
-        end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-        start = end - timedelta(days=self.cfg.days_back)
-
-        timeframe = self._to_timeframe()
-
-        print(
-            f"📥 Lade Minutendaten von Alpaca: "
-            f"Symbol={self.cfg.symbol}, "
-            f"Interval={self.cfg.interval}, "
-            f"Start={start.isoformat()}, "
-            f"End={end.isoformat()}"
-        )
-
+    def _fetch(self, symbol: str, interval: str, start: datetime, end: datetime) -> pd.DataFrame:
         request = StockBarsRequest(
-            symbol_or_symbols=self.cfg.symbol,
-            timeframe=timeframe,
+            symbol_or_symbols=symbol,
+            timeframe=self._to_timeframe(interval),
             start=start,
             end=end,
-            adjustment="raw",
-            feed="iex",
-
+            adjustment=self.cfg.adjustment,
+            feed=self.cfg.feed,
         )
 
         bars = self.client.get_stock_bars(request)
         df = bars.df
 
         if df is None or df.empty:
-            raise RuntimeError(
-                "❌ Es wurden keine Daten von Alpaca zurückgeliefert. "
-                "Prüfe Symbol, Zeitraum, API-Keys und ob das Asset unterstützt wird."
-            )
+            return pd.DataFrame()
 
-        # Wenn mehrere Symbole abgefragt werden, ist der Index MultiIndex.
-        # Hier nutzen wir nur ein Symbol -> ggf. herausfiltern.
+        # Bei einem Symbol kann trotzdem MultiIndex kommen
         if isinstance(df.index, pd.MultiIndex):
-            # MultiIndex-Level heißt normalerweise "symbol"
-            df = df.xs(self.cfg.symbol, level="symbol")
+            df = df.xs(symbol, level="symbol")
 
-        # Index schöner benennen
         df = df.sort_index()
         df.index.name = "timestamp"
+        return df
 
-        # Spaltennamen dokumentieren (typischerweise: open, high, low, close, volume, vwap, trade_count)
-        print(f"✅ {len(df)} Zeilen geladen. Spalten: {list(df.columns)}")
+    def download_bars(self, symbol: str, interval: str) -> pd.DataFrame:
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
+        # Für Daily ist "bis heute (00:00 UTC)" sauberer als "bis jetzt"
+        if interval == "1Day":
+            end = now.replace(hour=0, minute=0)
+        else:
+            end = now
+
+        start = end - timedelta(days=int(365 * self.cfg.years_back))
+
+        print(
+            f"📥 Lade Daten: Symbol={symbol}, Interval={interval}, "
+            f"Start={start.isoformat()}, End={end.isoformat()}, Feed={self.cfg.feed}"
+        )
+
+        # Daily: kein Chunking nötig
+        if interval == "1Day":
+            df = self._fetch(symbol, interval, start, end)
+            if df.empty:
+                raise RuntimeError(f"❌ Keine Daten erhalten für {symbol} ({interval}).")
+            df = df[~df.index.duplicated(keep="last")]
+            print(f"✅ Geladen ({symbol}, {interval}): {len(df)} Zeilen.")
+            return df
+
+        # Intraday: chunked Download empfohlen
+        if not self.cfg.chunk_download:
+            df = self._fetch(symbol, interval, start, end)
+            if df.empty:
+                raise RuntimeError(f"❌ Keine Daten erhalten für {symbol} ({interval}).")
+            df = df[~df.index.duplicated(keep="last")]
+            print(f"✅ Geladen ({symbol}, {interval}): {len(df)} Zeilen.")
+            return df
+
+        all_parts: list[pd.DataFrame] = []
+        cur = start
+        step = timedelta(days=self.cfg.chunk_days_intraday)
+
+        while cur < end:
+            nxt = min(cur + step, end)
+            print(f"  → {symbol} Chunk: {cur.date()} bis {nxt.date()} ...")
+
+            part = self._fetch(symbol, interval, cur, nxt)
+            if not part.empty:
+                all_parts.append(part)
+
+            # kleine Pause gegen Rate-Limits
+            time.sleep(0.1)
+            cur = nxt
+
+        if not all_parts:
+            raise RuntimeError(f"❌ Keine Daten erhalten für {symbol} ({interval}).")
+
+        df = pd.concat(all_parts).sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+
+        print(f"✅ Gesamt geladen ({symbol}, {interval}): {len(df)} Zeilen.")
         return df
 
 
-# ---------------------------------------------------------
-# 3) Data Acquisition Workflow
-# ---------------------------------------------------------
-class MSCIWorldDataAcquisitionAlpaca:
-    """
-    Orchestriert den kompletten Ablauf:
-    - sicherstellen, dass Ordner existieren
-    - Minutendaten mit AlpacaMarketDataClientWrapper laden
-    - CSV-Datei speichern
-    """
-
-    def __init__(
-        self,
-        cfg: ProjectConfig,
-        client: AlpacaMarketDataClientWrapper,
-    ) -> None:
+class DataAcquisition:
+    def __init__(self, cfg: ProjectConfig, client: AlpacaMarketDataClientWrapper) -> None:
         self.cfg = cfg
         self.client = client
 
-    def ensure_directories(self) -> None:
-        """
-        Stellt sicher, dass data/raw existiert.
-        """
+    def run(self) -> None:
         self.cfg.raw_data_dir.mkdir(parents=True, exist_ok=True)
 
-    def run(self) -> None:
-        """
-        Führt den kompletten ETL-Schritt aus:
-        - Ordner anlegen
-        - Daten laden
-        - CSV schreiben
-        """
-        self.ensure_directories()
-
-        df = self.client.download_intraday_minutes()
-
-        # CSV speichern
-        self.cfg.raw_csv_path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(self.cfg.raw_csv_path)
-
-        print(
-            f"💾 Rohdaten gespeichert unter: {self.cfg.raw_csv_path} "
-            f"({len(df)} Zeilen)."
-        )
+        for symbol, interval in self.cfg.symbol_configs:
+            df = self.client.download_bars(symbol, interval)
+            out = self.cfg.raw_csv_path(symbol, interval)
+            df.to_csv(out)
+            print(f"💾 Gespeichert: {out} ({len(df)} Zeilen)")
 
 
-# ---------------------------------------------------------
-# 4) Skript-Einstiegspunkt
-# ---------------------------------------------------------
 def main() -> None:
-    cfg = ProjectConfig()  # ggf. symbol/interval/days_back anpassen
+    cfg = ProjectConfig()
     client = AlpacaMarketDataClientWrapper(cfg)
-    acquisition = MSCIWorldDataAcquisitionAlpaca(cfg, client)
-    acquisition.run()
+    DataAcquisition(cfg, client).run()
 
 
 if __name__ == "__main__":
