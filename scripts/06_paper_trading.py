@@ -89,6 +89,10 @@ class AlpacaPaperClient:
         r.raise_for_status()
         return r.json()
 
+    def get_orders(self, status: str = "open") -> list:
+        """Return list of orders (default: open)."""
+        return self._get(f"/v2/orders?status={status}&limit=50")
+
     def _post(self, path: str, payload: dict):
         url = self.base_url + path
         r = requests.post(url, headers=self.headers, data=json.dumps(payload), timeout=30)
@@ -116,12 +120,100 @@ class AlpacaPaperClient:
 
 
 def build_features_from_1m(spy_1m: pd.DataFrame, gld_1m: pd.DataFrame) -> pd.DataFrame:
-    spy = spy_1m.copy().rename(columns=str.lower).add_prefix("spy_")
-    gld = gld_1m.copy().rename(columns=str.lower).add_prefix("gld_")
+    def normalize_and_prefix(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        df = df.copy()
+
+        # flatten MultiIndex columns -> "part1_part2"
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [
+                "_".join([str(p) for p in col if p is not None and str(p).strip() != ""]).strip()
+                for col in df.columns
+            ]
+
+        # ensure string columns, lowercase, replace spaces
+        df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+
+        # add prefix (avoid double prefix)
+        df = df.rename(columns={c: f"{prefix}_{c}" if not c.startswith(f"{prefix}_") else c for c in df.columns})
+
+        cols = list(df.columns)
+
+        # ensure a close column exists: prefer exact, then adj_close, then any containing 'close'
+        target_close = f"{prefix}_close"
+        close_candidates = [c for c in cols if c.endswith("_close") or "_close" in c]
+        if close_candidates and target_close not in cols:
+            chosen = next((c for c in close_candidates if "adj_close" in c), close_candidates[0])
+            df = df.rename(columns={chosen: target_close})
+            cols = list(df.columns)
+
+        # ensure a volume column exists
+        target_vol = f"{prefix}_volume"
+        vol_candidates = [c for c in cols if c.endswith("_volume") or "_volume" in c]
+        if vol_candidates and target_vol not in cols:
+            df = df.rename(columns={vol_candidates[0]: target_vol})
+            cols = list(df.columns)
+
+        # final sanity: if critical cols missing -> clear error with available cols
+        if target_close not in df.columns or target_vol not in df.columns:
+            raise KeyError(
+                f"Erwarte '{target_close}' und '{target_vol}' in den Spalten von {prefix}. "
+                f"Gefundene Spalten: {cols}"
+            )
+
+        # remove duplicated column labels if any
+        if df.columns.duplicated().any():
+            df = df.loc[:, ~df.columns.duplicated(keep="last")]
+
+        return df
+
+    spy = normalize_and_prefix(spy_1m, "spy")
+    gld = normalize_and_prefix(gld_1m, "gld")
 
     df = spy.join(gld, how="inner").sort_index()
+
+    # ensure no duplicated index
     df = df[~df.index.duplicated(keep="last")]
 
+    # --- Kompatibilität: erzeuge unpräfixierte Primärsymbol-Spalten (für Trainings-Feature-Namen) ---
+    # Kopiere spy_* -> unprefixed (wenn noch nicht vorhanden)
+    prim_cols = ["open", "high", "low", "close", "volume", "trade_count", "vwap"]
+    for col in prim_cols:
+        dst = col
+        src = f"spy_{col}"
+        if dst not in df.columns and src in df.columns:
+            df[dst] = df[src]
+
+    # vwap fallback: wenn kein spy_vwap vorhanden, berechne Typical Price (high+low+close)/3
+    if "vwap" not in df.columns:
+        if all(c in df.columns for c in ("spy_high", "spy_low", "spy_close")):
+            df["vwap"] = (df["spy_high"] + df["spy_low"] + df["spy_close"]) / 3.0
+        elif all(c in df.columns for c in ("high", "low", "close")):
+            df["vwap"] = (df["high"] + df["low"] + df["close"]) / 3.0
+
+    # trade_count fallback -> 0
+    if "trade_count" not in df.columns:
+        df["trade_count"] = 0
+
+    # Kopiere zentrale Feature-Namen vom prefixed- namespace (z. B. spy_ret_1m -> ret_1m)
+    compat_map = {
+        "ret_1m": "spy_ret_1m",
+        "ret_5m": "spy_ret_5m",
+        "ret_15m": "spy_ret_15m",
+        "roll_mean_5m": "spy_roll_mean_5m",
+        "roll_mean_15m": "spy_roll_mean_15m",
+        "roll_std_5m": "spy_roll_std_5m",
+        "roll_std_15m": "spy_roll_std_15m",
+        "vol_roll_mean_15m": "spy_vol_roll_mean_15m",
+        "vol_roll_std_15m": "spy_vol_roll_std_15m",
+        "close_to_roll_mean_15m": "spy_close_to_roll_mean_15m",
+        # ggf. weitere Mapping-Einträge hinzufügen
+    }
+    for dst, src in compat_map.items():
+        if dst not in df.columns and src in df.columns:
+            df[dst] = df[src]
+
+    # --- feature calculations (wie vorher) ---
+    # Falls die spy_*-Spalten noch nicht existieren (z.B. bei anderen yfinance-Formaten), erzeugen wir sie oben.
     df["spy_ret_1m"] = df["spy_close"].pct_change(1)
     df["spy_ret_5m"] = df["spy_close"].pct_change(5)
     df["spy_ret_15m"] = df["spy_close"].pct_change(15)
@@ -201,14 +293,80 @@ class LiveModel:
             raise ValueError("model_name must be 'logreg' or 'rf'")
 
     def predict_p_up(self, feat_row: pd.DataFrame) -> float:
-        if self.model is None:
-            raise RuntimeError("Model not fitted.")
-        X = feat_row[self.feature_cols]
-        if self.cfg.model_name == "logreg":
-            assert self.scaler is not None
-            Xs = self.scaler.transform(X)
-            return float(self.model.predict_proba(Xs)[:, 1][0])
-        return float(self.model.predict_proba(X)[:, 1][0])
+        """
+        Robust column alignment + scaling, returns probability for 'up'.
+        Fehlende Features werden mit 0 aufgefüllt statt einen KeyError zu werfen.
+        """
+        import pandas as pd
+
+        row = feat_row.copy()
+        if isinstance(row, pd.DataFrame):
+            if len(row) != 1:
+                raise ValueError("predict_p_up erwartet eine einzelne Zeile (DataFrame mit 1 Zeile).")
+            row = row.iloc[0]
+
+        available = list(feat_row.columns) if isinstance(feat_row, pd.DataFrame) else list(row.index)
+        symbol = self.cfg.primary_symbol.lower()
+
+        def clean_name(n: str) -> str:
+            s = str(n).lower().strip()
+            parts = [p for p in s.split("_") if p != ""]
+            dedup = []
+            for p in parts:
+                if not dedup or p != dedup[-1]:
+                    dedup.append(p)
+            if len(dedup) > 1 and dedup[-1] == symbol and dedup.count(symbol) > 1:
+                dedup.pop()
+            return "_".join(dedup)
+
+        cleaned_map = {clean_name(a): a for a in available}
+
+        mapping: dict[str, str] = {}
+        missing = []
+        for f in self.feature_cols:
+            if f in available:
+                continue
+            if f in cleaned_map:
+                mapping[cleaned_map[f]] = f
+                continue
+            candidates = [a for a in available if a.lower().endswith(f)]
+            if candidates:
+                mapping[candidates[0]] = f
+                continue
+            candidates = [a for a in available if clean_name(a).endswith(f)]
+            if candidates:
+                mapping[candidates[0]] = f
+                continue
+            candidates = [a for a in available if f in a.lower() or f in clean_name(a)]
+            if candidates:
+                chosen = next((c for c in candidates if symbol in c.lower()), candidates[0])
+                mapping[chosen] = f
+                continue
+            missing.append(f)
+
+        if mapping:
+            row = row.rename(mapping)
+
+        # statt KeyError: fehlende Features mit 0.0 auffüllen (z.B. trade_count, vwap)
+        not_found = [f for f in self.feature_cols if f not in row.index]
+        if not_found:
+            print(f"Warnung: fehlende Features {not_found} -> mit 0.0 aufgefüllt.")
+            for f in not_found:
+                row[f] = 0.0
+
+        X = pd.DataFrame([row[self.feature_cols].astype(float).values], columns=self.feature_cols)
+
+        if self.scaler is not None:
+            Xs = pd.DataFrame(self.scaler.transform(X), columns=self.feature_cols)
+        else:
+            Xs = X
+
+        if hasattr(self.model, "predict_proba"):
+            p = float(self.model.predict_proba(Xs)[:, 1][0])
+        else:
+            p = float(self.model.predict(Xs)[0])
+
+        return p
 
 
 def yf_fetch_1m(symbol: str, lookback_minutes: int) -> pd.DataFrame:
@@ -289,7 +447,22 @@ def main():
 
         if cfg.trade_only_when_market_open:
             clock = alp.get_clock()
-            if not clock.get("is_open", False):
+
+            # Debug: zeige clock details (UTC) — hilfreich für Timezone‑Verwirrung
+            print(
+                f"[DEBUG] loop_ts={loop_ts.isoformat()} clock_is_open={clock.get('is_open')} timestamp={clock.get('timestamp')} next_open={clock.get('next_open')} next_close={clock.get('next_close')}")
+
+            if not clock.get("is_open", False) and not cfg.allow_trading_during_extended_hours:
+                # zeige offene Orders zur Kontrolle (warum noch offene Order existiert)
+                try:
+                    open_orders = alp.get_orders("open")
+                    print(f"[DEBUG] offene Orders count={len(open_orders)}")
+                    for o in open_orders:
+                        print(
+                            f"[DEBUG] order id={o.get('id')} symbol={o.get('symbol')} status={o.get('status')} submitted_at={o.get('submitted_at')} filled_at={o.get('filled_at')}")
+                except Exception as e:
+                    print(f"[DEBUG] Fehler beim Abrufen von Orders: {e}")
+
                 print(f"[{loop_ts.isoformat()}] Market closed -> sleep")
                 time.sleep(cfg.poll_seconds)
                 continue

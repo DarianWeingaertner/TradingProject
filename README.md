@@ -215,9 +215,10 @@ Kennzahlen:
 
 ## 🧾 6. Paper Trading
 
-- Umsetzung über **Alpaca Paper Trading**
-- Identische Logik wie im Backtest
-- Logging von Orders, Trades und PnL
+- Orders: Alpaca Paper API (benötigt API Keys, siehe `docs/deployment.md`).
+- Live-Quotes: `yfinance` wird für 1‑Min‑Kurse im Paper‑Trading‑Loop verwendet; Alpaca wird nicht für Market Data verwendet.
+- Verhalten: Modell entscheidet auf der vorletzten 1‑Min‑Kerze, Order wird als Market Order gesendet (Ausführung = Open von t+1).
+- Hinweis: Falls Live‑Features (`vwap`, `trade_count`, ...) fehlen, füllt `predict_p_up` diese mit `0.0`. Empfohlen: Feature‑Pipeline anpassen und `train.csv` neu erzeugen, damit Live/Train übereinstimmen.
 
 Beobachtung:
 > Paper-Trading-Ergebnisse sind konsistent mit Backtests,  
