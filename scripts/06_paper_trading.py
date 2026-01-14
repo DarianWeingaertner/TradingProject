@@ -60,15 +60,28 @@ class ProjectConfig:
 
     # trading rules
     entry_threshold: float = 0.55
+    add_threshold: float = 0.65
+    reduce_threshold: float = 0.45
     exit_threshold: float = 0.50
-    max_holding_minutes: int = 15
+    max_holding_minutes: int = 45
 
     # position sizing
-    notional_usd: float = 1000.0
+    base_notional_usd: float = 1000.0
+    add_notional_usd: float = 500.0
+    mas_position_notional_usd: float = 3000.0
+
+    # trade management
+    max_open_trades: int = 3
+    max_adds_per_trade: int = 2
+    allow_scale_in: bool = True
+    allow_scale_out: bool = True
+
+    # NEW: how many sibling orders to create on entry
+    entry_splits: int = 3
 
     # polling
     poll_seconds: int = 60
-    lookback_minutes: int = 180  # >= 15 + rolling windows + safety
+    lookback_minutes: int = 240  # >= 15 + rolling windows + safety
 
     # safety
     trade_only_when_market_open: bool = True
@@ -150,41 +163,52 @@ def build_features_from_1m(spy_1m: pd.DataFrame, gld_1m: pd.DataFrame) -> pd.Dat
     df = spy.join(gld, how="inner").sort_index()
     df = df[~df.index.duplicated(keep="last")]
 
+    # Falls nach dem Join doppelte Spaltennamen entstehen, hier einmal bereinigen
+    df = df.loc[:, ~df.columns.duplicated()]
+    # --- SPY Features ---
     # SPY
-    df["spy_ret_1m"] = df["spy_close"].pct_change(1)
-    df["spy_ret_5m"] = df["spy_close"].pct_change(5)
-    df["spy_ret_15m"] = df["spy_close"].pct_change(15)
+    spy_close = df["spy_close"].squeeze().astype(float)
+    spy_volume = df["spy_volume"].squeeze().astype(float)
 
-    df["spy_roll_mean_5m"] = df["spy_close"].rolling(5).mean()
-    df["spy_roll_mean_15m"] = df["spy_close"].rolling(15).mean()
-    df["spy_roll_std_5m"] = df["spy_close"].rolling(5).std()
-    df["spy_roll_std_15m"] = df["spy_close"].rolling(15).std()
+    df["spy_ret_1m"] = spy_close.pct_change(1)
+    df["spy_ret_5m"] = spy_close.pct_change(5)
+    df["spy_ret_15m"] = spy_close.pct_change(15)
 
-    df["spy_vol_roll_mean_15m"] = df["spy_volume"].rolling(15).mean()
-    df["spy_vol_roll_std_15m"] = df["spy_volume"].rolling(15).std()
+    df["spy_roll_mean_5m"] = spy_close.rolling(5).mean()
+    df["spy_roll_mean_15m"] = spy_close.rolling(15).mean()
+    df["spy_roll_std_5m"] = spy_close.rolling(5).std()
+    df["spy_roll_std_15m"] = spy_close.rolling(15).std()
 
-    df["spy_close_to_roll_mean_15m"] = df["spy_close"] / df["spy_roll_mean_15m"] - 1
+    df["spy_vol_roll_mean_15m"] = spy_volume.rolling(15).mean()
+    df["spy_vol_roll_std_15m"] = spy_volume.rolling(15).std()
+
+    spy_roll_mean_15m = df["spy_roll_mean_15m"].squeeze().astype(float)
+    df["spy_close_to_roll_mean_15m"] = spy_close / spy_roll_mean_15m - 1.0
 
     # GLD
-    df["gld_ret_1m"] = df["gld_close"].pct_change(1)
-    df["gld_ret_5m"] = df["gld_close"].pct_change(5)
-    df["gld_ret_15m"] = df["gld_close"].pct_change(15)
+    gld_close = df["gld_close"].squeeze().astype(float)
+    gld_volume = df["gld_volume"].squeeze().astype(float)
 
-    df["gld_roll_mean_5m"] = df["gld_close"].rolling(5).mean()
-    df["gld_roll_mean_15m"] = df["gld_close"].rolling(15).mean()
-    df["gld_roll_std_5m"] = df["gld_close"].rolling(5).std()
-    df["gld_roll_std_15m"] = df["gld_close"].rolling(15).std()
+    df["gld_ret_1m"] = gld_close.pct_change(1)
+    df["gld_ret_5m"] = gld_close.pct_change(5)
+    df["gld_ret_15m"] = gld_close.pct_change(15)
 
-    df["gld_vol_roll_mean_15m"] = df["gld_volume"].rolling(15).mean()
-    df["gld_vol_roll_std_15m"] = df["gld_volume"].rolling(15).std()
+    df["gld_roll_mean_5m"] = gld_close.rolling(5).mean()
+    df["gld_roll_mean_15m"] = gld_close.rolling(15).mean()
+    df["gld_roll_std_5m"] = gld_close.rolling(5).std()
+    df["gld_roll_std_15m"] = gld_close.rolling(15).std()
 
-    df["gld_close_to_roll_mean_15m"] = df["gld_close"] / df["gld_roll_mean_15m"] - 1
+    df["gld_vol_roll_mean_15m"] = gld_volume.rolling(15).mean()
+    df["gld_vol_roll_std_15m"] = gld_volume.rolling(15).std()
+
+    gld_roll_mean_15m = df["gld_roll_mean_15m"].squeeze().astype(float)
+    df["gld_close_to_roll_mean_15m"] = gld_close / gld_roll_mean_15m - 1.0
 
     # Cross
     df["ret_spy_minus_gld_1m"] = df["spy_ret_1m"] - df["gld_ret_1m"]
     df["ret_spy_minus_gld_15m"] = df["spy_ret_15m"] - df["gld_ret_15m"]
     df["vol_ratio_spy_gld_15m"] = df["spy_roll_std_15m"] / (df["gld_roll_std_15m"] + 1e-12)
-    df["price_ratio_spy_gld"] = df["spy_close"] / (df["gld_close"] + 1e-12)
+    df["price_ratio_spy_gld"] = spy_close / (gld_close + 1e-12)
 
     # Time features
     df["hour"] = df.index.hour
@@ -194,8 +218,22 @@ def build_features_from_1m(spy_1m: pd.DataFrame, gld_1m: pd.DataFrame) -> pd.Dat
     return df
 
 
+
 def feature_cols_from_train(train_df: pd.DataFrame, target_col: str = "target_up") -> list[str]:
-    return [c for c in train_df.columns if c != target_col and not c.startswith("future_ret_")]
+    drop_prefixes = ("future_ret_",)  # bleibt
+    drop_exact = {"spy_trade_count", "spy_vwap", "gld_trade_count", "gld_vwap"}
+
+    cols = []
+    for c in train_df.columns:
+        if c == target_col:
+            continue
+        if any(c.startswith(p) for p in drop_prefixes):
+            continue
+        if c in drop_exact:
+            continue
+        cols.append(c)
+    return cols
+
 
 
 # -------------------------
@@ -279,6 +317,24 @@ def append_log(log_path: Path, row: dict) -> None:
         df.to_csv(log_path, mode="a", header=False, index=False)
 
 
+def split_qty(total_qty: int, splits: int) -> list[int]:
+    """Split integer total_qty into 'splits' parts (FIFO-friendly), sum(parts)==total_qty."""
+    if splits <= 1 or total_qty <= 1:
+        return [total_qty] if total_qty > 0 else []
+    base = total_qty // splits
+    rem = total_qty % splits
+    parts = []
+    for i in range(splits):
+        add = 1 if i < rem else 0
+        q = base + add
+        if q > 0:
+            parts.append(q)
+    # if base==0 but total_qty>0 ensure we create single-unit parts up to total_qty
+    if not parts and total_qty > 0:
+        parts = [1] * total_qty
+    return parts
+
+
 # -------------------------
 # Main loop
 # -------------------------
@@ -299,8 +355,8 @@ def main():
     live_model = LiveModel(cfg)
     live_model.fit_from_train_csv(train_path)
 
-    # local state
-    state = {"in_position": False, "entry_time_utc": None}
+    # local state (neu: entries list of dicts)
+    state = {"entries": []}
     if state_path.exists():
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -348,47 +404,183 @@ def main():
         pos = alp.get_position(cfg.primary_symbol)
         in_pos_api = pos is not None
 
-        # reconcile local state
-        if in_pos_api and not state.get("in_position", False):
-            state["in_position"] = True
-            state["entry_time_utc"] = loop_ts.isoformat()
-        if (not in_pos_api) and state.get("in_position", False):
-            state["in_position"] = False
-            state["entry_time_utc"] = None
+        # reconcile old single-entry state (backwards compat)
+        if "entries" not in state:
+            # alte single-entry state behandeln
+            if state.get("in_position", False):
+                qty_guess = int(float(pos.get("qty", 0))) if pos else 1
+                state["entries"] = [{"qty": qty_guess, "entry_time_utc": state.get("entry_time_utc")}]
+            else:
+                state["entries"] = []
+            state.pop("in_position", None)
+            state.pop("entry_time_utc", None)
 
-        holding_min = 0
-        if state.get("in_position") and state.get("entry_time_utc"):
-            try:
-                entry_t = datetime.fromisoformat(state["entry_time_utc"])
-                holding_min = int((loop_ts - entry_t).total_seconds() / 60.0)
-            except Exception:
-                holding_min = 0
+        # Reconcile: falls API qty anders als lokale Summe, adjustiere grob
+        pos_qty_api = int(float(pos.get("qty", 0))) if pos else 0
+        local_total_qty = sum(int(e.get("qty", 0)) for e in state["entries"])
+        if pos_qty_api != local_total_qty:
+            if pos_qty_api == 0:
+                state["entries"] = []
+            else:
+                state["entries"] = [{"qty": pos_qty_api, "entry_time_utc": loop_ts.isoformat()}]
+            local_total_qty = pos_qty_api
 
         action = "HOLD"
         order_resp = None
 
-        # Trading rules
-        if not in_pos_api:
-            if p_up >= cfg.entry_threshold:
-                qty = ensure_int_qty(cfg.notional_usd, last_spy_price)
-                if qty > 0:
-                    order_resp = alp.submit_market_order(cfg.primary_symbol, "buy", qty)
-                    action = f"BUY qty={qty}"
-                    state["in_position"] = True
-                    state["entry_time_utc"] = loop_ts.isoformat()
+        # --- ENTRY: create multiple sibling orders (split) ---
+        if p_up >= cfg.entry_threshold:
+            # compute total qty from notional and split into parts
+            total_qty = ensure_int_qty(cfg.base_notional_usd, last_spy_price)
+
+            parts = split_qty(total_qty, cfg.entry_splits)
+            created = []
+            for q in parts:
+                if q <= 0:
+                    continue
+                try:
+                    resp = alp.submit_market_order(cfg.primary_symbol, "buy", q)
+                except Exception as e:
+                    print(f"[{loop_ts.isoformat()}] Fehler beim Buy Order: {e}")
+                    resp = None
+                # update local state per executed leg (order may fail => still record attempt with qty)
+                entry = {"qty": int(q), "entry_time_utc": loop_ts.isoformat()}
+                if isinstance(resp, dict):
+                    entry["order_id"] = resp.get("id")
+                state["entries"].append(entry)
+                created.append(q)
+                # optional tiny delay between splits to avoid API throttling
+                time.sleep(0.1)
+            if created:
+                action = f"BUY_SPLITS qtys={created}"
+                order_resp = {"created_splits": created}
+                # --- SCALE IN (add to winners) ---
+                if (
+                        state["entries"]
+                        and cfg.allow_scale_in
+                        and p_up >= cfg.add_threshold
+                ):
+                    total_notional = sum(e["qty"] for e in state["entries"]) * last_spy_price
+                    if (
+                            total_notional + cfg.add_notional_usd
+                            <= cfg.mas_position_notional_usd
+                    ):
+                        # count adds per trade (approx via len)
+                        if len(state["entries"]) < (cfg.entry_splits + cfg.max_adds_per_trade):
+                            add_qty = ensure_int_qty(cfg.add_notional_usd, last_spy_price)
+                            if add_qty > 0:
+                                try:
+                                    resp = alp.submit_market_order(
+                                        cfg.primary_symbol, "buy", add_qty
+                                    )
+                                except Exception as e:
+                                    print(f"[{loop_ts.isoformat()}] Fehler beim Scale-In: {e}")
+                                    resp = None
+
+                                state["entries"].append({
+                                    "qty": int(add_qty),
+                                    "entry_time_utc": loop_ts.isoformat(),
+                                    "order_id": resp.get("id") if isinstance(resp, dict) else None,
+                                    "type": "scale_in",
+                                })
+
+                                action = f"SCALE_IN qty={add_qty}"
+
+
         else:
-            if (p_up <= cfg.exit_threshold) or (holding_min >= cfg.max_holding_minutes):
-                qty = int(float(pos.get("qty", 0))) if pos else 0
-                if qty > 0:
-                    order_resp = alp.submit_market_order(cfg.primary_symbol, "sell", qty)
-                    action = f"SELL qty={qty}"
-                    state["in_position"] = False
-                    state["entry_time_utc"] = None
+            # --- EXIT logic: aggressive exit -> sell entries FIFO (each as separate order) ---
+            # 1) aggressive exit when p_up <= exit_threshold -> sell all entries
+            if local_total_qty > 0 and p_up <= cfg.exit_threshold:
+                # --- optional SCALE_OUT (reduce on weakness) executed BEFORE full sell ---
+                if cfg.allow_scale_out and p_up <= cfg.reduce_threshold and state["entries"]:
+                    # sell oldest entry (FIFO) once
+                    e_old = state["entries"][0]
+                    q_old = int(e_old.get("qty", 0))
+                    if q_old > 0:
+                        try:
+                            resp = alp.submit_market_order(cfg.primary_symbol, "sell", q_old)
+                        except Exception as ex:
+                            print(f"[{loop_ts.isoformat()}] Fehler beim Scale-Out: {ex}")
+                            resp = None
+                        state["entries"].pop(0)
+                        action = f"SCALE_OUT qty={q_old}"
+                        order_resp = {"scale_out_qty": q_old}
+                        # update local_total_qty after scale out
+                        local_total_qty = sum(int(e.get("qty", 0)) for e in state["entries"])
+
+                # --- then aggressive exit: sell all remaining entries FIFO ---
+                if local_total_qty > 0:
+                    sell_qty = 0
+                    sold_parts = []
+                    for e in list(state["entries"]):
+                        q = int(e.get("qty", 0))
+                        if q <= 0:
+                            continue
+                        try:
+                            resp = alp.submit_market_order(cfg.primary_symbol, "sell", q)
+                        except Exception as ex:
+                            print(f"[{loop_ts.isoformat()}] Fehler beim Sell Order: {ex}")
+                            resp = None
+                        sell_qty += q
+                        sold_parts.append(q)
+                        # remove that entry
+                        state["entries"].remove(e)
+                        time.sleep(0.05)
+                    if sell_qty > 0:
+                        action = f"SELL_ALL_SPLIT qtys={sold_parts}"
+                        order_resp = {"sold_splits": sold_parts}
+
+
+            else:
+                # 2) time-based partial exit (FIFO): sell only stale entries
+                stale_idxs = []
+                stale_qty = 0
+                for i, e in enumerate(state["entries"]):
+                    try:
+                        entry_t = datetime.fromisoformat(e.get("entry_time_utc"))
+                        holding_min_entry = int((loop_ts - entry_t).total_seconds() / 60.0)
+                    except Exception:
+                        holding_min_entry = 0
+                    if holding_min_entry >= cfg.max_holding_minutes:
+                        stale_idxs.append(i)
+                        stale_qty += int(e.get("qty", 0))
+
+                if stale_qty > 0:
+                    sold_parts = []
+                    # sell identified stale entries (iterate copy to remove)
+                    for i in sorted(stale_idxs, reverse=True):
+                        e = state["entries"][i]
+                        q = int(e.get("qty", 0))
+                        if q <= 0:
+                            state["entries"].pop(i)
+                            continue
+                        try:
+                            resp = alp.submit_market_order(cfg.primary_symbol, "sell", q)
+                        except Exception as ex:
+                            print(f"[{loop_ts.isoformat()}] Fehler beim Sell Order: {ex}")
+                            resp = None
+                        sold_parts.append(q)
+                        state["entries"].pop(i)
+                        time.sleep(0.05)
+                    action = f"SELL_STALE_SPLIT qtys={sold_parts}"
+                    order_resp = {"sold_splits": sold_parts}
 
         # persist state
         state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
         # log row
+        holding_min = 0
+        if state.get("entries"):
+            # compute average holding as an approximate indicator
+            mins = []
+            for e in state["entries"]:
+                try:
+                    entry_t = datetime.fromisoformat(e.get("entry_time_utc"))
+                    mins.append(int((loop_ts - entry_t).total_seconds() / 60.0))
+                except Exception:
+                    pass
+            holding_min = int(sum(mins) / len(mins)) if mins else 0
+
         log_row = {
             "timestamp_utc": loop_ts.isoformat(),
             "feature_time_utc": str(t),
