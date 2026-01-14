@@ -1,28 +1,25 @@
-# scripts/05_backtest.py
+# scripts/05_backtesting.py
 """
-Step 05 — Backtesting (Out-of-sample on val.csv)
-------------------------------------------------
+Step 05 — Backtesting (Out-of-sample on val.csv) with Tune/Test split + optional calibration + threshold sweep
+------------------------------------------------------------------------------------------------------------
 Ziele:
-- Trading-Algorithmus aus trainiertem Modell ableiten
-- Entry/Exit Regeln spezifizieren (probability thresholds + max holding)
-- Backtest auf VAL (zeitlich später als Train) durchführen
-- Performance-Metriken & Plots speichern
-- Vergleich zu Buy&Hold (SPY)
-
-Wichtig:
-- Keine Data Leakage: Modell wird auf train.csv fitten, Signale/Backtest auf val.csv.
-- Execution: Entscheidungen basieren auf Features zur Zeit t; Ausführung am OPEN von t+1.
+- Modell auf train.csv fitten (kein Leakage)
+- VAL zeitlich splitten: Tune (für Calibration + Threshold Auswahl) und Test (echtes Report)
+- Optional: Probability Calibration (sigmoid/isotonic) nur auf Tune
+- Optional: Threshold Sweep auf Tune, Auswahl nach Metric, Report auf Test
+- Trading Regeln identisch zu Paper Trading:
+  - Decision auf Bar t (features/p_up[t])
+  - Execution am OPEN von t+1
+  - Entry: p_up >= entry_threshold (mit No-Trade Zone via Hysterese möglich)
+  - Exit:  p_up <= exit_threshold ODER max_holding_minutes erreicht
+- Kosten: fee_bps + slippage_bps pro Side
 
 Outputs:
-- data/backtests/trades_{model}.csv
-- data/backtests/equity_curve_{model}.csv
-- data/backtests/metrics_{model}.json
-- figures/backtest_equity_curve_{model}.png
-- figures/backtest_drawdown_{model}.png
-- figures/backtest_trade_return_hist_{model}.png
-- figures/backtest_entry_distribution_hour_{model}.png
-- figures/backtest_entries_over_time_{model}.png
-- figures/backtest_examples_{model}.png
+- data/backtests/trades_{tag}.csv
+- data/backtests/equity_curve_{tag}.csv
+- data/backtests/metrics_{tag}.json
+- data/backtests/sweep_results_{tag}.csv (wenn --sweep)
+- figures/... (wie gehabt) + zusätzlich p_up quantile plot
 """
 
 from __future__ import annotations
@@ -31,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import argparse
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -39,6 +37,7 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
 
 
 # -------------------------
@@ -48,15 +47,21 @@ from sklearn.ensemble import RandomForestClassifier
 class ProjectConfig:
     primary_symbol: str = "SPY"
 
-    prediction_horizon_min: int = 15  # max holding (minutes) in backtest
+    prediction_horizon_min: int = 15  # max holding (minutes)
 
-    # Trading rules
+    # Base thresholds (can be overridden by sweep)
     entry_threshold: float = 0.55
     exit_threshold: float = 0.50
 
-    # Costs (bps = 1/100 of a percent)
+    # Optional extra hysteresis: effective_entry=max(entry, 0.5+margin), effective_exit=min(exit, 0.5-margin)
+    no_trade_margin: float = 0.00
+
+    # Costs (bps)
     fee_bps: float = 1.0
     slippage_bps: float = 1.0
+
+    # Val split: first part is Tune, second is Test
+    tune_frac: float = 0.50
 
     base_dir: Path = Path(__file__).resolve().parents[1]
 
@@ -81,28 +86,17 @@ def _load_processed_csv(path: Path) -> pd.DataFrame:
         raise FileNotFoundError(f"File not found: {path}")
 
     df = pd.read_csv(path, index_col=0)
-    # index is timestamp string written by pandas -> parse to datetime
     df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
     if df.index.isna().any():
         raise ValueError(f"Failed to parse timestamps in index for: {path}")
-
-    df = df.sort_index()
-    return df
+    return df.sort_index()
 
 
 def _feature_columns(df: pd.DataFrame, target_col: str = "target_up") -> list[str]:
-    cols = []
-    for c in df.columns:
-        if c == target_col:
-            continue
-        if c.startswith("future_ret_"):
-            continue
-        cols.append(c)
-    return cols
+    return [c for c in df.columns if c != target_col and not c.startswith("future_ret_")]
 
 
 def _cost_rate(cfg: ProjectConfig) -> float:
-    # total cost per transaction side (entry and exit both apply)
     return (cfg.fee_bps + cfg.slippage_bps) / 10_000.0
 
 
@@ -110,18 +104,35 @@ def _safe_div(a: float, b: float) -> float:
     return float(a / b) if b != 0 else float("nan")
 
 
+def _time_split(df: pd.DataFrame, tune_frac: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if not (0.1 <= tune_frac <= 0.9):
+        raise ValueError("tune_frac should be between 0.1 and 0.9 (reasonable split).")
+    n = len(df)
+    if n < 1000:
+        raise ValueError("VAL too short for a meaningful tune/test split.")
+    cut = int(n * tune_frac)
+    tune = df.iloc[:cut].copy()
+    test = df.iloc[cut:].copy()
+    return tune, test
+
+
 # -------------------------
 # Backtest Engine
 # -------------------------
 class Backtester:
-    def __init__(self, cfg: ProjectConfig, model_name: str = "logreg") -> None:
+    def __init__(self, cfg: ProjectConfig, model_name: str = "logreg", calibrate: str = "none") -> None:
         self.cfg = cfg
         self.model_name = model_name.lower().strip()
         if self.model_name not in {"logreg", "rf"}:
             raise ValueError("model_name must be one of: logreg, rf")
 
-        self.scaler: StandardScaler | None = None
+        self.calibrate = calibrate.lower().strip()
+        if self.calibrate not in {"none", "sigmoid", "isotonic"}:
+            raise ValueError("calibrate must be one of: none, sigmoid, isotonic")
+
+        self.scaler: Optional[StandardScaler] = None
         self.model = None
+        self.calibrator = None  # CalibratedClassifierCV with cv='prefit'
 
     # ---- training ----
     def fit_model(self, train_df: pd.DataFrame) -> list[str]:
@@ -151,6 +162,29 @@ class Backtester:
 
         return feat_cols
 
+    def fit_calibrator_on_tune(self, tune_df: pd.DataFrame, feat_cols: list[str]) -> None:
+        if self.calibrate == "none":
+            self.calibrator = None
+            return
+        if self.model is None:
+            raise RuntimeError("Base model not fitted.")
+
+        X_tune = tune_df[feat_cols]
+        y_tune = tune_df["target_up"].astype(int)
+
+        if X_tune.isnull().any().any():
+            raise ValueError("NaNs in tune features. Ensure val.csv is clean.")
+
+        if self.model_name == "logreg":
+            assert self.scaler is not None
+            X_tune_in = self.scaler.transform(X_tune)
+        else:
+            X_tune_in = X_tune
+
+        # Calibrate prefit model on Tune only (no leakage into Test)
+        self.calibrator = CalibratedClassifierCV(self.model, method=self.calibrate, cv="prefit")
+        self.calibrator.fit(X_tune_in, y_tune)
+
     def predict_proba(self, df: pd.DataFrame, feat_cols: list[str]) -> pd.Series:
         X = df[feat_cols]
         if X.isnull().any().any():
@@ -158,56 +192,65 @@ class Backtester:
 
         if self.model_name == "logreg":
             assert self.scaler is not None and self.model is not None
-            Xs = self.scaler.transform(X)
-            p = self.model.predict_proba(Xs)[:, 1]
+            X_in = self.scaler.transform(X)
         else:
             assert self.model is not None
-            p = self.model.predict_proba(X)[:, 1]
+            X_in = X
+
+        if self.calibrator is not None:
+            p = self.calibrator.predict_proba(X_in)[:, 1]
+        else:
+            p = self.model.predict_proba(X_in)[:, 1]
 
         return pd.Series(p, index=df.index, name="p_up")
 
     # ---- trading rules ----
+    def _effective_thresholds(self) -> tuple[float, float]:
+        entry = float(self.cfg.entry_threshold)
+        exit_ = float(self.cfg.exit_threshold)
+
+        m = float(self.cfg.no_trade_margin)
+        if m > 0:
+            entry = max(entry, 0.5 + m)
+            exit_ = min(exit_, 0.5 - m)
+
+        # sanity: must be entry > exit for hysteresis; otherwise you churn
+        if entry <= exit_:
+            # force a tiny hysteresis instead of silently running nonsense
+            entry = max(entry, exit_ + 1e-6)
+        return entry, exit_
+
     def _should_enter(self, p_up: float) -> bool:
-        return p_up >= self.cfg.entry_threshold
+        entry, _ = self._effective_thresholds()
+        return p_up >= entry
 
     def _should_exit(self, p_up: float, minutes_in_trade: int) -> bool:
+        _, exit_ = self._effective_thresholds()
         if minutes_in_trade >= self.cfg.prediction_horizon_min:
             return True
-        return p_up <= self.cfg.exit_threshold
+        return p_up <= exit_
 
     # ---- backtest ----
     def run_backtest(self, val_df: pd.DataFrame, p_up: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-        """
-        Long-only, fully invested when in position.
-        Decisions at time t, execution at OPEN of t+1.
-        Mark-to-market uses SPY close at each timestamp.
-        """
         if "spy_open" not in val_df.columns or "spy_close" not in val_df.columns:
             raise ValueError("val_df must contain spy_open and spy_close columns (from Step 03).")
 
         cost = _cost_rate(self.cfg)
-
         idx = val_df.index
         if len(idx) < 3:
             raise ValueError("val_df too short for backtest.")
 
-        # state
         cash = 1.0
         shares = 0.0
         in_pos = False
+
         entry_i: int | None = None
         entry_time: pd.Timestamp | None = None
         entry_price_eff: float | None = None
 
-        # outputs
         equity_records = []
         trades = []
 
-        # For example plots: track entries/exits
-        entry_marks = []
-        exit_marks = []
-
-        # iterate over bars; use i and i+1 (execution on next bar open)
         for i in range(len(idx) - 1):
             t = idx[i]
             t_next = idx[i + 1]
@@ -216,18 +259,11 @@ class Backtester:
             open_next = float(val_df.loc[t_next, "spy_open"])
             p_t = float(p_up.loc[t])
 
-            # mark-to-market equity at time t (using close)
-            if in_pos:
-                equity_t = shares * close_t
-            else:
-                equity_t = cash
-
+            equity_t = shares * close_t if in_pos else cash
             equity_records.append({"timestamp": t, "equity": equity_t, "in_position": int(in_pos), "p_up": p_t})
 
-            # decide action (executed at t_next open)
             if not in_pos:
                 if self._should_enter(p_t):
-                    # enter at next open with costs
                     fill = open_next * (1.0 + cost)
                     if fill <= 0:
                         continue
@@ -238,19 +274,15 @@ class Backtester:
                     entry_i = i + 1
                     entry_time = t_next
                     entry_price_eff = fill
-
-                    entry_marks.append((t_next, open_next))
             else:
                 assert entry_i is not None and entry_time is not None and entry_price_eff is not None
-                minutes_in_trade = (i + 1) - entry_i  # minutes elapsed until next open
+                minutes_in_trade = (i + 1) - entry_i
                 if self._should_exit(p_t, minutes_in_trade):
-                    # exit at next open with costs
                     exit_fill = open_next * (1.0 - cost)
                     cash = shares * exit_fill
                     shares = 0.0
                     in_pos = False
 
-                    # trade stats
                     gross_ret = (exit_fill / entry_price_eff) - 1.0
                     trades.append(
                         {
@@ -262,19 +294,17 @@ class Backtester:
                             "return": gross_ret,
                         }
                     )
-                    exit_marks.append((t_next, open_next))
 
                     entry_i = None
                     entry_time = None
                     entry_price_eff = None
 
-        # final mark-to-market / liquidation on last close
+        # liquidation on last close
         t_last = idx[-1]
         close_last = float(val_df.loc[t_last, "spy_close"])
         p_last = float(p_up.loc[t_last])
 
         if in_pos:
-            # liquidate at last close with costs (approx)
             exit_fill = close_last * (1.0 - cost)
             cash = shares * exit_fill
             shares = 0.0
@@ -293,11 +323,8 @@ class Backtester:
                     "return": gross_ret,
                 }
             )
-            exit_marks.append((t_last, close_last))
 
-        equity_records.append(
-            {"timestamp": t_last, "equity": cash, "in_position": 0, "p_up": p_last}
-        )
+        equity_records.append({"timestamp": t_last, "equity": cash, "in_position": 0, "p_up": p_last})
 
         equity_df = pd.DataFrame(equity_records).set_index("timestamp").sort_index()
         trades_df = pd.DataFrame(trades)
@@ -307,11 +334,6 @@ class Backtester:
             trades_df = trades_df.sort_values("entry_time")
 
         metrics = self._compute_metrics(equity_df, trades_df, val_df)
-
-        # store marks for plotting
-        metrics["_entry_marks_count"] = int(len(entry_marks))
-        metrics["_exit_marks_count"] = int(len(exit_marks))
-
         return equity_df, trades_df, metrics
 
     def _compute_metrics(self, equity_df: pd.DataFrame, trades_df: pd.DataFrame, val_df: pd.DataFrame) -> dict:
@@ -320,12 +342,10 @@ class Backtester:
 
         total_return = float(eq.iloc[-1] / eq.iloc[0] - 1.0)
 
-        # drawdown
         running_max = eq.cummax()
         dd = (eq / running_max) - 1.0
         max_dd = float(dd.min())
 
-        # simple “minute Sharpe” (not annualized; optional)
         mu = float(ret_series.mean())
         sig = float(ret_series.std(ddof=0))
         sharpe_min = _safe_div(mu, sig) if sig > 0 else float("nan")
@@ -335,14 +355,19 @@ class Backtester:
         avg_trade = float(trades_df["return"].mean()) if n_trades > 0 else float("nan")
         med_trade = float(trades_df["return"].median()) if n_trades > 0 else float("nan")
 
-        # buy&hold on SPY for same VAL period
         spy_close = val_df["spy_close"].astype(float)
         buy_hold_return = float(spy_close.iloc[-1] / spy_close.iloc[0] - 1.0)
 
+        entry_eff, exit_eff = self._effective_thresholds()
+
         return {
             "model": self.model_name,
-            "entry_threshold": self.cfg.entry_threshold,
-            "exit_threshold": self.cfg.exit_threshold,
+            "calibrate": self.calibrate,
+            "entry_threshold_base": self.cfg.entry_threshold,
+            "exit_threshold_base": self.cfg.exit_threshold,
+            "no_trade_margin": self.cfg.no_trade_margin,
+            "entry_threshold_effective": entry_eff,
+            "exit_threshold_effective": exit_eff,
             "max_holding_minutes": self.cfg.prediction_horizon_min,
             "fee_bps": self.cfg.fee_bps,
             "slippage_bps": self.cfg.slippage_bps,
@@ -360,11 +385,53 @@ class Backtester:
 
 
 # -------------------------
-# Plotting
+# Diagnostics: p_up quantiles vs future_ret_15m
+# -------------------------
+def plot_pup_quantiles(cfg: ProjectConfig, df: pd.DataFrame, p_up: pd.Series, tag: str) -> Path:
+    cfg.figures_dir.mkdir(parents=True, exist_ok=True)
+    out = cfg.figures_dir / f"pup_quantiles_{tag}.png"
+
+    if "future_ret_15m" not in df.columns:
+        # If you don't have it in val.csv, you can't do this diagnostic.
+        plt.figure(figsize=(10, 4))
+        plt.title(f"p_up quantiles ({tag}) — future_ret_15m missing")
+        plt.tight_layout()
+        plt.savefig(out, dpi=150)
+        plt.close()
+        return out
+
+    tmp = df.copy()
+    tmp["p_up"] = p_up.astype(float)
+
+    # 10 quantiles
+    tmp = tmp.dropna(subset=["p_up", "future_ret_15m"])
+    if len(tmp) < 1000:
+        plt.figure(figsize=(10, 4))
+        plt.title(f"p_up quantiles ({tag}) — insufficient data")
+        plt.tight_layout()
+        plt.savefig(out, dpi=150)
+        plt.close()
+        return out
+
+    tmp["q"] = pd.qcut(tmp["p_up"], 10, labels=False, duplicates="drop")
+    grp = tmp.groupby("q")["future_ret_15m"].mean()
+
+    plt.figure(figsize=(10, 4))
+    plt.bar(grp.index.astype(int), grp.values)
+    plt.title(f"Mean future_ret_15m by p_up decile ({tag})")
+    plt.xlabel("p_up decile (low→high)")
+    plt.ylabel("Mean future_ret_15m")
+    plt.tight_layout()
+    plt.savefig(out, dpi=150)
+    plt.close()
+    return out
+
+
+# -------------------------
+# Plotting (existing)
 # -------------------------
 def plot_equity_vs_buyhold(cfg: ProjectConfig, equity_df: pd.DataFrame, val_df: pd.DataFrame, tag: str) -> Path:
     cfg.figures_dir.mkdir(parents=True, exist_ok=True)
-
     eq = equity_df["equity"].astype(float)
     spy = val_df["spy_close"].astype(float)
     buyhold = spy / spy.iloc[0] * eq.iloc[0]
@@ -416,7 +483,6 @@ def plot_trade_return_hist(cfg: ProjectConfig, trades_df: pd.DataFrame, tag: str
         return out
 
     rets = trades_df["return"].astype(float)
-    # clip tails for readability
     lo, hi = rets.quantile(0.01), rets.quantile(0.99)
     rets = rets.clip(lo, hi)
 
@@ -437,7 +503,6 @@ def plot_entry_distribution(cfg: ProjectConfig, trades_df: pd.DataFrame, tag: st
     out_time = cfg.figures_dir / f"backtest_entries_over_time_{tag}.png"
 
     if trades_df.empty:
-        # create empty plots for consistency
         plt.figure(figsize=(8, 4))
         plt.title(f"Entry distribution by hour ({tag}) — no trades")
         plt.tight_layout()
@@ -449,12 +514,10 @@ def plot_entry_distribution(cfg: ProjectConfig, trades_df: pd.DataFrame, tag: st
         plt.tight_layout()
         plt.savefig(out_time, dpi=150)
         plt.close()
-
         return out_hour, out_time
 
     entries = pd.to_datetime(trades_df["entry_time"], utc=True)
 
-    # by hour
     hours = entries.dt.hour
     counts = hours.value_counts().sort_index()
 
@@ -467,7 +530,6 @@ def plot_entry_distribution(cfg: ProjectConfig, trades_df: pd.DataFrame, tag: st
     plt.savefig(out_hour, dpi=150)
     plt.close()
 
-    # over time (per day)
     per_day = entries.dt.floor("D").value_counts().sort_index()
 
     plt.figure(figsize=(10, 4))
@@ -483,14 +545,10 @@ def plot_entry_distribution(cfg: ProjectConfig, trades_df: pd.DataFrame, tag: st
 
 
 def plot_examples(cfg: ProjectConfig, val_df: pd.DataFrame, trades_df: pd.DataFrame, tag: str, n_days: int = 3) -> Path:
-    """
-    Simple example plot: last N days of VAL with entry/exit vertical lines.
-    """
     cfg.figures_dir.mkdir(parents=True, exist_ok=True)
     out = cfg.figures_dir / f"backtest_examples_{tag}.png"
 
     spy_close = val_df["spy_close"].astype(float)
-
     if len(spy_close) == 0:
         plt.figure(figsize=(12, 5))
         plt.title(f"Examples ({tag}) — no data")
@@ -507,7 +565,6 @@ def plot_examples(cfg: ProjectConfig, val_df: pd.DataFrame, trades_df: pd.DataFr
     plt.plot(window.index, window.values, label="SPY close")
 
     if not trades_df.empty:
-        # only mark trades that overlap the window
         for _, tr in trades_df.iterrows():
             et = pd.to_datetime(tr["entry_time"], utc=True)
             xt = pd.to_datetime(tr["exit_time"], utc=True)
@@ -516,7 +573,7 @@ def plot_examples(cfg: ProjectConfig, val_df: pd.DataFrame, trades_df: pd.DataFr
             if xt >= window.index.min() and xt <= window.index.max():
                 plt.axvline(xt, linewidth=1)
 
-    plt.title(f"Backtest Examples (last {n_days} days of VAL) ({tag})")
+    plt.title(f"Backtest Examples (last {n_days} days of TEST) ({tag})")
     plt.xlabel("Time (UTC)")
     plt.ylabel("SPY close")
     plt.legend()
@@ -527,16 +584,127 @@ def plot_examples(cfg: ProjectConfig, val_df: pd.DataFrame, trades_df: pd.DataFr
 
 
 # -------------------------
+# Sweep
+# -------------------------
+def _frange(a: float, b: float, step: float) -> list[float]:
+    vals = []
+    x = a
+    # inclusive-ish
+    while x <= b + 1e-12:
+        vals.append(round(float(x), 6))
+        x += step
+    return vals
+
+
+def run_threshold_sweep(
+    cfg: ProjectConfig,
+    bt: Backtester,
+    tune_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feat_cols: list[str],
+    metric: str = "total_return",
+    entry_grid: tuple[float, float, float] = (0.52, 0.70, 0.02),
+    exit_grid: tuple[float, float, float] = (0.30, 0.52, 0.02),
+    hold_grid: tuple[int, int, int] = (5, 60, 5),
+) -> tuple[pd.DataFrame, dict]:
+    metric = metric.strip().lower()
+    if metric not in {"total_return", "sharpe_minute", "max_drawdown"}:
+        raise ValueError("metric must be one of: total_return, sharpe_minute, max_drawdown")
+
+    p_tune = bt.predict_proba(tune_df, feat_cols)
+    p_test = bt.predict_proba(test_df, feat_cols)
+
+    entries = _frange(*entry_grid)
+    exits = _frange(*exit_grid)
+    holds = list(range(hold_grid[0], hold_grid[1] + 1, hold_grid[2]))
+
+    rows = []
+    best = None
+    best_score = None
+
+    for e in entries:
+        for x in exits:
+            if x >= e:
+                continue
+            for h in holds:
+                cfg_tmp = ProjectConfig(
+                    entry_threshold=e,
+                    exit_threshold=x,
+                    prediction_horizon_min=h,
+                    fee_bps=cfg.fee_bps,
+                    slippage_bps=cfg.slippage_bps,
+                    no_trade_margin=cfg.no_trade_margin,
+                    tune_frac=cfg.tune_frac,
+                )
+                bt_tmp = Backtester(cfg_tmp, model_name=bt.model_name, calibrate=bt.calibrate)
+                # reuse already fitted model/scaler/calibrator
+                bt_tmp.model = bt.model
+                bt_tmp.scaler = bt.scaler
+                bt_tmp.calibrator = bt.calibrator
+
+                _, _, m_tune = bt_tmp.run_backtest(tune_df, p_tune)
+                _, _, m_test = bt_tmp.run_backtest(test_df, p_test)
+
+                row = {
+                    "entry": e,
+                    "exit": x,
+                    "hold": h,
+                    "tune_total_return": m_tune["total_return"],
+                    "tune_sharpe_minute": m_tune["sharpe_minute"],
+                    "tune_max_drawdown": m_tune["max_drawdown"],
+                    "test_total_return": m_test["total_return"],
+                    "test_sharpe_minute": m_test["sharpe_minute"],
+                    "test_max_drawdown": m_test["max_drawdown"],
+                    "test_n_trades": m_test["n_trades"],
+                }
+                rows.append(row)
+
+                score = row[f"tune_{metric}"]
+                # for max_drawdown, "higher" is better (less negative) -> maximize it
+                if best_score is None or (score > best_score):
+                    best_score = score
+                    best = row
+
+    res = pd.DataFrame(rows).sort_values(by=f"tune_{metric}", ascending=False)
+    assert best is not None
+    return res, best
+
+
+# -------------------------
 # Main
 # -------------------------
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="logreg", choices=["logreg", "rf"])
+
+    # base params (used when not sweeping)
     parser.add_argument("--entry", type=float, default=0.55)
     parser.add_argument("--exit", type=float, default=0.50)
     parser.add_argument("--hold", type=int, default=15)
+
     parser.add_argument("--fee_bps", type=float, default=1.0)
     parser.add_argument("--slippage_bps", type=float, default=1.0)
+
+    parser.add_argument("--tune_frac", type=float, default=0.50)
+    parser.add_argument("--calibrate", type=str, default="none", choices=["none", "sigmoid", "isotonic"])
+    parser.add_argument("--no_trade_margin", type=float, default=0.00)
+
+    # sweep
+    parser.add_argument("--sweep", action="store_true")
+    parser.add_argument("--sweep_metric", type=str, default="sharpe_minute", choices=["total_return", "sharpe_minute", "max_drawdown"])
+
+    parser.add_argument("--sweep_entry_min", type=float, default=0.52)
+    parser.add_argument("--sweep_entry_max", type=float, default=0.70)
+    parser.add_argument("--sweep_entry_step", type=float, default=0.02)
+
+    parser.add_argument("--sweep_exit_min", type=float, default=0.30)
+    parser.add_argument("--sweep_exit_max", type=float, default=0.52)
+    parser.add_argument("--sweep_exit_step", type=float, default=0.02)
+
+    parser.add_argument("--sweep_hold_min", type=int, default=5)
+    parser.add_argument("--sweep_hold_max", type=int, default=60)
+    parser.add_argument("--sweep_hold_step", type=int, default=5)
+
     args = parser.parse_args()
 
     cfg = ProjectConfig(
@@ -545,6 +713,9 @@ def main() -> None:
         prediction_horizon_min=args.hold,
         fee_bps=args.fee_bps,
         slippage_bps=args.slippage_bps,
+        tune_frac=args.tune_frac,
+        calibrate=getattr(args, "calibrate", "none") if False else args.calibrate,  # keep linters calm
+        no_trade_margin=args.no_trade_margin,
     )
 
     train_path = cfg.processed_data_dir / "train.csv"
@@ -553,16 +724,43 @@ def main() -> None:
     train_df = _load_processed_csv(train_path)
     val_df = _load_processed_csv(val_path)
 
-    bt = Backtester(cfg, model_name=args.model)
+    tune_df, test_df = _time_split(val_df, cfg.tune_frac)
+
+    bt = Backtester(cfg, model_name=args.model, calibrate=args.calibrate)
     feat_cols = bt.fit_model(train_df)
-    p_up = bt.predict_proba(val_df, feat_cols=feat_cols)
 
-    equity_df, trades_df, metrics = bt.run_backtest(val_df, p_up)
+    # Fit calibrator on Tune ONLY (optional)
+    bt.fit_calibrator_on_tune(tune_df, feat_cols)
 
-    # save outputs
+    # Either sweep or run single
+    if args.sweep:
+        sweep_df, best = run_threshold_sweep(
+            cfg=cfg,
+            bt=bt,
+            tune_df=tune_df,
+            test_df=test_df,
+            feat_cols=feat_cols,
+            metric=args.sweep_metric,
+            entry_grid=(args.sweep_entry_min, args.sweep_entry_max, args.sweep_entry_step),
+            exit_grid=(args.sweep_exit_min, args.sweep_exit_max, args.sweep_exit_step),
+            hold_grid=(args.sweep_hold_min, args.sweep_hold_max, args.sweep_hold_step),
+        )
+
+        # set cfg to best for final test report
+        cfg.entry_threshold = float(best["entry"])
+        cfg.exit_threshold = float(best["exit"])
+        cfg.prediction_horizon_min = int(best["hold"])
+
+    # Predict on TEST and run backtest
+    p_test = bt.predict_proba(test_df, feat_cols=feat_cols)
+    equity_df, trades_df, metrics = bt.run_backtest(test_df, p_test)
+
+    # Tag
+    tag = f"{args.model}_cal{args.calibrate}_m{cfg.no_trade_margin:.2f}_t{cfg.tune_frac:.2f}_e{cfg.entry_threshold:.2f}_x{cfg.exit_threshold:.2f}_h{cfg.prediction_horizon_min}"
     cfg.backtests_dir.mkdir(parents=True, exist_ok=True)
-    tag = args.model
+    cfg.figures_dir.mkdir(parents=True, exist_ok=True)
 
+    # Save outputs
     trades_out = cfg.backtests_dir / f"trades_{tag}.csv"
     equity_out = cfg.backtests_dir / f"equity_curve_{tag}.csv"
     metrics_out = cfg.backtests_dir / f"metrics_{tag}.json"
@@ -573,19 +771,28 @@ def main() -> None:
     with open(metrics_out, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
-    # plots
-    p1 = plot_equity_vs_buyhold(cfg, equity_df, val_df, tag=tag)
+    # Plots on TEST
+    p1 = plot_equity_vs_buyhold(cfg, equity_df, test_df, tag=tag)
     p2 = plot_drawdown(cfg, equity_df, tag=tag)
     p3 = plot_trade_return_hist(cfg, trades_df, tag=tag)
     p4, p5 = plot_entry_distribution(cfg, trades_df, tag=tag)
-    p6 = plot_examples(cfg, val_df, trades_df, tag=tag, n_days=3)
+    p6 = plot_examples(cfg, test_df, trades_df, tag=tag, n_days=3)
+    p7 = plot_pup_quantiles(cfg, test_df, p_test, tag=tag)
 
-    # console summary
-    print("\n=== Backtest Summary (VAL, out-of-sample) ===")
+    sweep_out = None
+    if args.sweep:
+        sweep_out = cfg.backtests_dir / f"sweep_results_{tag}.csv"
+        sweep_df.to_csv(sweep_out, index=False)
+
+    # Console summary
+    print("\n=== Backtest Summary (TEST, out-of-sample) ===")
     for k in [
         "model",
+        "calibrate",
         "val_start",
         "val_end",
+        "entry_threshold_effective",
+        "exit_threshold_effective",
         "total_return",
         "buy_hold_return",
         "max_drawdown",
@@ -601,12 +808,15 @@ def main() -> None:
     print(f" - {trades_out}")
     print(f" - {equity_out}")
     print(f" - {metrics_out}")
+    if sweep_out is not None:
+        print(f" - {sweep_out}")
     print(f" - {p1}")
     print(f" - {p2}")
     print(f" - {p3}")
     print(f" - {p4}")
     print(f" - {p5}")
     print(f" - {p6}")
+    print(f" - {p7}")
 
 
 if __name__ == "__main__":
